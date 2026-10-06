@@ -19,6 +19,7 @@ use windows::Win32::System::Threading::{
 };
 use winit::event_loop::EventLoopProxy;
 
+use crate::jpeg_quant::JpegQuant;
 use crate::AppEvent;
 use crate::triple_buffer::Producer;
 
@@ -62,6 +63,8 @@ pub enum CaptureFrame {
         y_data: Vec<u8>,
         u_data: Vec<u8>,
         v_data: Vec<u8>,
+        /// Quantization tables when the frame was decoded from MJPEG.
+        quant: Option<JpegQuant>,
     },
     /// Frame data lives in a shared DX12/CUDA GPU buffer (zero-copy path).
     /// The renderer knows where the actual buffers are; this just carries
@@ -73,6 +76,7 @@ pub enum CaptureFrame {
         buffer_index: usize,
         // Retained through GPU copy completion before CUDA may reuse this set.
         lease: Arc<()>,
+        quant: Option<JpegQuant>,
     },
 }
 
@@ -86,6 +90,7 @@ impl CaptureFrame {
             y_data: Vec::new(),
             u_data: Vec::new(),
             v_data: Vec::new(),
+            quant: None,
         }
     }
 
@@ -116,7 +121,9 @@ impl CaptureFrame {
                 y_data,
                 u_data,
                 v_data,
+                quant,
             } => {
+                *quant = None;
                 *width = new_width;
                 *height = new_height;
                 *format = new_format;
@@ -131,6 +138,23 @@ impl CaptureFrame {
             }
             #[cfg(feature = "gpu-decode")]
             Self::Gpu { .. } => unreachable!("coerced to Cpu above"),
+        }
+    }
+
+    /// The MJPEG quantization tables this frame was decoded with, if any.
+    pub fn quant(&self) -> Option<&JpegQuant> {
+        match self {
+            Self::Cpu { quant, .. } => quant.as_ref(),
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { quant, .. } => quant.as_ref(),
+        }
+    }
+
+    pub fn set_quant(&mut self, value: Option<JpegQuant>) {
+        match self {
+            Self::Cpu { quant, .. } => *quant = value,
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { quant, .. } => *quant = value,
         }
     }
 
@@ -608,7 +632,8 @@ fn run_directshow_capture_inner(
     // MJPEG and raw frames are each self-contained, so when several packets
     // are already queued only the newest is worth decoding. Codecs with
     // inter-frame prediction (H.264 from webcams) must see every packet.
-    let drain_backlog = matches!(decoder.id(), codec::Id::MJPEG | codec::Id::RAWVIDEO);
+    let is_mjpeg = decoder.id() == codec::Id::MJPEG;
+    let drain_backlog = is_mjpeg || decoder.id() == codec::Id::RAWVIDEO;
     let mut stale_packets_skipped = 0_u64;
     let mut consecutive_read_errors = 0_u32;
 
@@ -756,6 +781,7 @@ fn run_directshow_capture_inner(
         }
 
         // Software decode path (fallback or non-MJPEG formats)
+        let packet_quant = if is_mjpeg { packet.data().and_then(JpegQuant::parse) } else { None };
         if let Err(error) = decoder.send_packet(&packet) {
             packet_errors += 1;
             if packet_errors <= 10 || packet_errors.is_multiple_of(50) {
@@ -779,6 +805,8 @@ fn run_directshow_capture_inner(
                 frame,
             )
                 .map_err(|error| CaptureError::Open(format!("failed to convert decoded frame: {error}")))?;
+            // MJPEG decodes one frame per packet, so these are this frame's tables.
+            frame.set_quant(packet_quant);
             let width = frame.width();
             let height = frame.height();
             total_frames += 1;
@@ -1095,6 +1123,7 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
                 y_data,
                 u_data: uv_data,
                 v_data: Vec::new(),
+                quant: None,
             }
         }
         PixelFormat::Yuvj422p => {
@@ -1122,6 +1151,7 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
                 y_data,
                 u_data,
                 v_data,
+                quant: None,
             }
         }
     }

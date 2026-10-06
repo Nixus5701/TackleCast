@@ -6,6 +6,7 @@
 #![cfg(feature = "gpu-decode")]
 
 use crate::capture::{CaptureFrame, PixelFormat};
+use crate::jpeg_quant::JpegQuant;
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::ptr;
@@ -995,6 +996,7 @@ impl NvjpegDecoder {
                     height,
                     buffer_index,
                     lease,
+                    quant: JpegQuant::parse(&jpeg_data),
                 };
                 Ok(())
             }
@@ -1053,6 +1055,7 @@ impl NvjpegDecoder {
                 y_data.copy_from_slice(&buf.y[..y_size]);
                 u_data.copy_from_slice(&buf.u[..uv_size]);
                 v_data.copy_from_slice(&buf.v[..uv_size]);
+                out.set_quant(JpegQuant::parse(&jpeg_data));
 
                 Ok(())
             }

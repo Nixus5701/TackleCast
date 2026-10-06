@@ -16,6 +16,7 @@ use winit::window::Window;
 
 #[cfg(all(windows, feature = "rtx-vsr"))]
 mod vsr;
+mod cleanup;
 
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 10.0 / 255.0,
@@ -51,6 +52,10 @@ pub struct Renderer {
     /// frames never queue up behind each other on the GPU.
     gate_gpu_queue: bool,
     last_submission: Option<wgpu::SubmissionIndex>,
+    jpeg_cleanup: cleanup::JpegCleanup,
+    /// Whether the frame on screen is the artifact-reduced copy.
+    cleanup_active: bool,
+    cleanup_status: String,
     // Shared DX12 buffers for zero-copy GPU decode (None = not available)
     #[cfg(feature = "gpu-decode")]
     shared_gpu_buffers: Option<crate::dx12_interop::SharedGpuBuffers>,
@@ -238,6 +243,7 @@ impl Renderer {
         });
 
         let egui_renderer = EguiRenderer::new(&device, surface_format, None, 1, false);
+        let jpeg_cleanup = cleanup::JpegCleanup::new(&device);
 
         Ok(Self {
             presentation_modes: caps.present_modes.clone(),
@@ -267,6 +273,9 @@ impl Renderer {
             egui_renderer,
             gate_gpu_queue: presentation_mode.gates_gpu_queue(),
             last_submission: None,
+            jpeg_cleanup,
+            cleanup_active: false,
+            cleanup_status: "Waiting for video".to_owned(),
             #[cfg(feature = "gpu-decode")]
             shared_gpu_buffers: None,
         })
@@ -290,6 +299,10 @@ impl Renderer {
 
     pub fn set_scale_filter(&mut self, filter: ScaleFilter) {
         self.scale_filter = filter;
+    }
+
+    pub fn artifact_reduction_status(&self) -> &str {
+        &self.cleanup_status
     }
 
     pub fn super_resolution_status(&self) -> &str {
@@ -339,7 +352,7 @@ impl Renderer {
                 }
             }
             let result = self.vsr.as_mut().expect("VSR initialized").process(
-                &self.device, &self.queue, encoder, self.frame_serial);
+                &self.device, &self.queue, encoder, self.frame_serial, self.cleanup_active);
             match result {
                 Ok(true) => {
                     self.super_resolution_status = "Request submitted — verify in NVIDIA App".to_owned();
@@ -400,6 +413,7 @@ impl Renderer {
                 y_data,
                 u_data,
                 v_data,
+                ..
             } => self.upload_cpu_frame(*width, *height, *format, y_data, u_data, v_data),
             #[cfg(feature = "gpu-decode")]
             CaptureFrame::Gpu {
@@ -407,8 +421,35 @@ impl Renderer {
                 height,
                 buffer_index,
                 lease,
+                ..
             } => self.upload_gpu_frame(*width, *height, *buffer_index, lease.clone()),
         }
+        self.reduce_artifacts(frame.quant());
+    }
+
+    /// Runs MJPEG artifact reduction on the frame just uploaded, submitting
+    /// it ahead of the frame's render (and RTX Super Resolution's input pass).
+    fn reduce_artifacts(&mut self, quant: Option<&crate::jpeg_quant::JpegQuant>) {
+        let strength = self.image_adjustments.artifact_reduction.round() as u32;
+        self.cleanup_active = false;
+        let Some(video_frame) = self.video_frame.as_mut() else {
+            return;
+        };
+        let (Some(quant), Some(targets)) = (quant, video_frame.cleanup.as_mut()) else {
+            self.cleanup_status = "Inactive: capture is not MJPEG, so there are no JPEG artifacts".to_owned();
+            return;
+        };
+        if strength == 0 {
+            self.cleanup_status = format!("Off (stream JPEG quality ≈ {})", quant.estimated_quality());
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tacklecast-jpeg-cleanup-encoder"),
+        });
+        self.jpeg_cleanup.encode(&self.queue, &mut encoder, targets, quant, strength);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.cleanup_active = true;
+        self.cleanup_status = format!("Active (stream JPEG quality ≈ {})", quant.estimated_quality());
     }
 
     fn upload_cpu_frame(
@@ -433,6 +474,7 @@ impl Renderer {
         if needs_rebuild {
             self.video_frame = Some(VideoFrameResources::new(
                 &self.device,
+                &self.jpeg_cleanup,
                 &self.video_bind_group_layout,
                 &self.video_samplers,
                 &self.uniforms,
@@ -510,6 +552,7 @@ impl Renderer {
         if needs_rebuild {
             self.video_frame = Some(VideoFrameResources::new(
                 &self.device,
+                &self.jpeg_cleanup,
                 &self.video_bind_group_layout,
                 &self.video_samplers,
                 &self.uniforms,
@@ -738,7 +781,7 @@ impl Renderer {
 
             if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
                 pass.set_pipeline(&self.video_pipeline);
-                pass.set_bind_group(0, &video_frame.bind_group, &[]);
+                pass.set_bind_group(0, video_frame.bind_group(self.cleanup_active), &[]);
                 #[cfg(all(windows, feature = "rtx-vsr"))]
                 if use_super_resolution {
                     if let Some(vsr) = &self.vsr {
@@ -846,11 +889,23 @@ struct VideoFrameResources {
     u_texture: wgpu::Texture,
     v_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    /// Artifact-reduction storage and the bind group that samples its output.
+    /// Only 4:2:2 frames can come from MJPEG, so NV12 has none.
+    cleanup: Option<cleanup::CleanupTargets>,
+    clean_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl VideoFrameResources {
+    fn bind_group(&self, cleaned: bool) -> &wgpu::BindGroup {
+        match (&self.clean_bind_group, cleaned) {
+            (Some(clean), true) => clean,
+            _ => &self.bind_group,
+        }
+    }
+
     fn new(
         device: &wgpu::Device,
+        jpeg_cleanup: &cleanup::JpegCleanup,
         layout: &wgpu::BindGroupLayout,
         samplers: &VideoSamplers,
         uniforms: &wgpu::Buffer,
@@ -875,6 +930,12 @@ impl VideoFrameResources {
 
         let bind_group = video_bind_group(device, layout, samplers, uniforms, image_uniforms,
                                            &y_texture, &u_texture, &v_texture);
+        let cleanup = (format == PixelFormat::Yuvj422p)
+            .then(|| jpeg_cleanup.create_targets(device, [&y_texture, &u_texture, &v_texture]));
+        let clean_bind_group = cleanup.as_ref().map(|targets| {
+            let [y, u, v] = targets.outputs();
+            video_bind_group(device, layout, samplers, uniforms, image_uniforms, y, u, v)
+        });
 
         Self {
             width,
@@ -884,6 +945,8 @@ impl VideoFrameResources {
             u_texture,
             v_texture,
             bind_group,
+            cleanup,
+            clean_bind_group,
         }
     }
 }

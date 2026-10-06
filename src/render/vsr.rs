@@ -10,6 +10,7 @@ pub(super) struct VsrRender {
     source: wgpu::Texture,
     enhanced: wgpu::Texture,
     source_bind_group: wgpu::BindGroup,
+    clean_source_bind_group: Option<wgpu::BindGroup>,
     source_pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     pub pipeline: wgpu::RenderPipeline,
@@ -45,6 +46,11 @@ impl VsrRender {
         });
         let source_bind_group = video_bind_group(device, source_layout, samplers, &uniforms, &neutral_image_uniforms,
             &frame.y_texture, &frame.u_texture, &frame.v_texture);
+        // Same source, after MJPEG artifact reduction, so VSR enhances the cleaned frame.
+        let clean_source_bind_group = frame.cleanup.as_ref().map(|targets| {
+            let [y, u, v] = targets.outputs();
+            video_bind_group(device, source_layout, samplers, &uniforms, &neutral_image_uniforms, y, u, v)
+        });
         let source_pipeline = pipeline(device, source_layout, VIDEO_SHADER, wgpu::TextureFormat::Bgra8Unorm);
         let output_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rtx-vsr-display-layout"),
@@ -68,11 +74,12 @@ impl VsrRender {
         });
         let pipeline = pipeline(device, &output_layout, DISPLAY_SHADER, target_format);
         Ok(Self { bridge, dimensions, format: frame.format, source, enhanced,
-                  source_bind_group, source_pipeline, bind_group, pipeline, last_serial: None })
+                  source_bind_group, clean_source_bind_group, source_pipeline, bind_group, pipeline, last_serial: None })
     }
 
     pub fn process(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
-                   encoder: &mut wgpu::CommandEncoder, serial: u64) -> Result<bool, String> {
+                   encoder: &mut wgpu::CommandEncoder, serial: u64,
+                   cleaned: bool) -> Result<bool, String> {
         if self.last_serial == Some(serial) { return Ok(true); }
         let d = self.dimensions;
         let view = self.source.create_view(&Default::default());
@@ -89,7 +96,11 @@ impl VsrRender {
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
             });
             pass.set_pipeline(&self.source_pipeline);
-            pass.set_bind_group(0, &self.source_bind_group, &[]);
+            let source = match (&self.clean_source_bind_group, cleaned) {
+                (Some(clean), true) => clean,
+                _ => &self.source_bind_group,
+            };
+            pass.set_bind_group(0, source, &[]);
             pass.draw(0..6, 0..1);
         }
         prepass.copy_texture_to_buffer(

@@ -37,3 +37,21 @@ fn executable_asset_decodes_for_owned_window_icon() {
     assert_eq!(icon.as_raw().len(), (icon.width() * icon.height() * 4) as usize);
     assert!(icon.pixels().any(|p| p.0[3] != 0));
 }
+#[path = "../../../src/jpeg_quant.rs"] mod jpeg_quant;
+
+#[test]
+fn jpeg_cleanup_compute_shader_validates() {
+    let source = include_str!("../../../src/render/jpeg_cleanup.wgsl");
+    let module = naga::front::wgsl::parse_str(source).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&module)
+        .unwrap();
+    let entry_points: Vec<_> = module.entry_points.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(entry_points, ["spp_shift", "finalize"]);
+    // Params must match the Rust struct in render/cleanup.rs: 32 bytes of
+    // scalars followed by 64 quantization steps.
+    let (_, params) = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("Params")).unwrap();
+    let naga::TypeInner::Struct { span, ref members } = params.inner else { panic!("Params must be a struct") };
+    assert_eq!(span, 288);
+    assert_eq!(members.last().unwrap().offset, 32);
+}

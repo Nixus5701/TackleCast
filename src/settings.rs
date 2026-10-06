@@ -55,11 +55,14 @@ pub struct ImageAdjustments {
     pub saturation: f32,
     pub hue: f32,
     pub gamma: f32,
+    /// MJPEG artifact reduction strength in percent; 0 is off, 100 the tuned
+    /// default. Only MJPEG frames are filtered.
+    pub artifact_reduction: f32,
 }
 impl Default for ImageAdjustments {
     fn default() -> Self {
         Self { vsr_sharpness: 50.0, brightness: 0.0, contrast: 100.0,
-               saturation: 100.0, hue: 0.0, gamma: 1.0 }
+               saturation: 100.0, hue: 0.0, gamma: 1.0, artifact_reduction: 100.0 }
     }
 }
 impl ImageAdjustments {
@@ -74,6 +77,7 @@ impl ImageAdjustments {
             saturation: limit(self.saturation, 0.0, 200.0, 100.0),
             hue: limit(self.hue, -180.0, 180.0, 0.0),
             gamma: limit(self.gamma, 0.25, 3.0, 1.0),
+            artifact_reduction: limit(self.artifact_reduction, 0.0, 200.0, 100.0),
         }
     }
     /// Eight scalars, matching the 32-byte ImageParams WGSL uniform.
@@ -311,8 +315,9 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"image_adjustments":{"vsr_sharpness":20.0}}"#).unwrap();
         assert_eq!(partial.image_adjustments.gamma, 1.0);
         assert_eq!(partial.image_adjustments.contrast, 100.0);
+        assert_eq!(partial.image_adjustments.artifact_reduction, 100.0);
         let p = ImageAdjustments { vsr_sharpness: 20.0, brightness: -12.0, contrast: 115.0,
-            saturation: 90.0, hue: 25.0, gamma: 1.2 };
+            saturation: 90.0, hue: 25.0, gamma: 1.2, artifact_reduction: 60.0 };
         let settings = Settings { image_adjustments: p, ..Settings::default() };
         let decoded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.image_adjustments, p);
@@ -321,10 +326,11 @@ mod tests {
     #[test]
     fn invalid_image_controls_cannot_send_nonfinite_values_to_gpu() {
         let bad = ImageAdjustments { vsr_sharpness: -400.0, brightness: f32::NAN,
-            contrast: f32::INFINITY, saturation: -5.0, hue: 500.0, gamma: 0.0 };
+            contrast: f32::INFINITY, saturation: -5.0, hue: 500.0, gamma: 0.0,
+            artifact_reduction: f32::NAN };
         let p = bad.sanitized();
         assert_eq!(p, ImageAdjustments { vsr_sharpness: 0.0, brightness: 0.0,
-            contrast: 100.0, saturation: 0.0, hue: 180.0, gamma: 0.25 });
+            contrast: 100.0, saturation: 0.0, hue: 180.0, gamma: 0.25, artifact_reduction: 100.0 });
         assert!(bad.uniforms().iter().all(|v| v.is_finite()));
     }
 

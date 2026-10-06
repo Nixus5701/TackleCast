@@ -9,6 +9,7 @@ mod dx12_interop;
 mod gpu_decode;
 #[cfg(feature = "gpu-decode")]
 mod gpu_monitor;
+mod jpeg_quant;
 mod logger;
 mod mmcss;
 mod render;
@@ -415,6 +416,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let overlay = self.overlay_info();
                 if let (Some(renderer), Some(ui)) = (&mut self.renderer, &mut self.ui) {
                     let super_resolution_status = renderer.super_resolution_status().to_owned();
+                    let artifact_reduction_status = renderer.artifact_reduction_status().to_owned();
                     let prepared_ui = ui.prepare(
                         window,
                         UiFrame {
@@ -425,6 +427,7 @@ impl ApplicationHandler<AppEvent> for App {
                             audio_outputs: &self.audio_outputs,
                             is_fullscreen: self.is_fullscreen,
                             super_resolution_status: &super_resolution_status,
+                            artifact_reduction_status: &artifact_reduction_status,
                         },
                     );
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;

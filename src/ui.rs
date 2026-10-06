@@ -49,6 +49,7 @@ pub struct UiFrame<'a> {
     pub audio_outputs: &'a [AudioDevice],
     pub is_fullscreen: bool,
     pub super_resolution_status: &'a str,
+    pub artifact_reduction_status: &'a str,
 }
 
 pub struct PreparedUi {
@@ -136,6 +137,7 @@ impl UiState {
                     frame.audio_outputs,
                     frame.is_fullscreen,
                     frame.super_resolution_status,
+                    frame.artifact_reduction_status,
                     &mut ui_output,
                 );
             }
@@ -243,6 +245,7 @@ fn draw_menu(
     audio_outputs: &[AudioDevice],
     is_fullscreen: bool,
     super_resolution_status: &str,
+    artifact_reduction_status: &str,
     output: &mut UiOutput,
 ) {
     let screen_rect = ctx.screen_rect();
@@ -326,6 +329,11 @@ fn draw_menu(
                             "Scaling Filter",
                             &mut draft.scaling_filter
                         );
+
+                        ui.add(Slider::new(&mut draft.image_adjustments.artifact_reduction, 0.0..=200.0)
+                                .text("MJPEG artifact reduction").suffix("%").step_by(5.0))
+                            .on_hover_text("Removes JPEG blocking, ringing and mosquito noise using the stream's own quantization tables; it never removes more than the encoder could have added. 0% is off, 100% the tuned default. Applied before Super Resolution. Live preview.");
+                        ui.label(RichText::new(artifact_reduction_status).small().color(COLOR_TEXT_SECONDARY));
 
                         ui.add_enabled(
                             cfg!(all(windows, feature = "rtx-vsr")),
