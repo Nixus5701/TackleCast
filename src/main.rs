@@ -10,6 +10,7 @@ mod gpu_decode;
 #[cfg(feature = "gpu-decode")]
 mod gpu_monitor;
 mod jpeg_quant;
+mod latency;
 mod logger;
 mod mmcss;
 mod render;
@@ -661,6 +662,7 @@ impl App {
             detailed: self.settings.detailed_overlay,
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
+            latency: self.renderer.as_ref().and_then(Renderer::latency_report),
         }
     }
 

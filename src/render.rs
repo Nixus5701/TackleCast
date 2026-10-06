@@ -56,6 +56,7 @@ pub struct Renderer {
     /// Whether the frame on screen is the artifact-reduced copy.
     cleanup_active: bool,
     cleanup_status: String,
+    latency: crate::latency::LatencyMeter,
     // Shared DX12 buffers for zero-copy GPU decode (None = not available)
     #[cfg(feature = "gpu-decode")]
     shared_gpu_buffers: Option<crate::dx12_interop::SharedGpuBuffers>,
@@ -276,6 +277,7 @@ impl Renderer {
             jpeg_cleanup,
             cleanup_active: false,
             cleanup_status: "Waiting for video".to_owned(),
+            latency: crate::latency::LatencyMeter::new(),
             #[cfg(feature = "gpu-decode")]
             shared_gpu_buffers: None,
         })
@@ -299,6 +301,26 @@ impl Renderer {
 
     pub fn set_scale_filter(&mut self, filter: ScaleFilter) {
         self.scale_filter = filter;
+    }
+
+    /// Rolling average of this PC's share of the latency, for the overlay.
+    pub fn latency_report(&self) -> Option<crate::latency::LatencySample> {
+        self.latency.report()
+    }
+
+    fn record_latency(&mut self, timing: crate::latency::FrameTiming, picked_at: std::time::Instant) {
+        use crate::latency::{millis, time_to_next_vblank, LatencySample};
+        let (Some(captured), Some(decoded)) = (timing.captured, timing.decoded) else {
+            return;
+        };
+        let presented = std::time::Instant::now();
+        let sample = LatencySample {
+            decode: millis(captured, decoded),
+            queue: millis(decoded, picked_at),
+            render: millis(picked_at, presented),
+            vblank: time_to_next_vblank().unwrap_or(0.0),
+        };
+        self.latency.record(presented, sample);
     }
 
     pub fn artifact_reduction_status(&self) -> &str {
@@ -698,10 +720,13 @@ impl Renderer {
 
         self.poll_gpu();
         // Surface acquisition may block. Read the newest capture only after it finishes.
-        let uploaded = if let Some(latest) = capture.and_then(|capture| capture.latest_frame()) {
+        let picked_at = std::time::Instant::now();
+        let uploaded_timing = if let Some(latest) = capture.and_then(|capture| capture.latest_frame()) {
+            let timing = latest.timing();
             self.upload_frame(latest);
-            true
-        } else { false };
+            Some(timing)
+        } else { None };
+        let uploaded = uploaded_timing.is_some();
 
         let view = frame
             .texture
@@ -833,6 +858,9 @@ impl Renderer {
 
         self.window.pre_present_notify();
         frame.present();
+        if let Some(timing) = uploaded_timing {
+            self.record_latency(timing, picked_at);
+        }
         Ok(uploaded)
     }
 }

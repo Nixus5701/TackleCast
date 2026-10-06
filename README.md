@@ -2,6 +2,8 @@ The presentation menu includes **Mailbox (low latency)**, a tear-free option tha
 
 New: **MJPEG artifact reduction** (Esc > Video), a quantization-aware GPU filter for blocking, ringing and mosquito noise. See [docs/ARTIFACT-REDUCTION.md](docs/ARTIFACT-REDUCTION.md).
 
+New: **live latency** in the FPS overlay, with a per-stage breakdown in the detailed overlay. See [docs/LATENCY-OVERLAY.md](docs/LATENCY-OVERLAY.md).
+
 This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
 
 # TackleCast

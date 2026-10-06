@@ -997,6 +997,7 @@ impl NvjpegDecoder {
                     buffer_index,
                     lease,
                     quant: JpegQuant::parse(&jpeg_data),
+                    timing: Default::default(),
                 };
                 Ok(())
             }

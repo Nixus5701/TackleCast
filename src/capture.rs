@@ -20,6 +20,7 @@ use windows::Win32::System::Threading::{
 use winit::event_loop::EventLoopProxy;
 
 use crate::jpeg_quant::JpegQuant;
+use crate::latency::FrameTiming;
 use crate::AppEvent;
 use crate::triple_buffer::Producer;
 
@@ -68,6 +69,7 @@ pub enum CaptureFrame {
         v_data: Vec<u8>,
         /// Quantization tables when the frame was decoded from MJPEG.
         quant: Option<JpegQuant>,
+        timing: FrameTiming,
     },
     /// Frame data lives in a shared DX12/CUDA GPU buffer (zero-copy path).
     /// The renderer knows where the actual buffers are; this just carries
@@ -80,6 +82,7 @@ pub enum CaptureFrame {
         // Retained through GPU copy completion before CUDA may reuse this set.
         lease: Arc<()>,
         quant: Option<JpegQuant>,
+        timing: FrameTiming,
     },
 }
 
@@ -94,6 +97,7 @@ impl CaptureFrame {
             u_data: Vec::new(),
             v_data: Vec::new(),
             quant: None,
+            timing: FrameTiming::default(),
         }
     }
 
@@ -125,8 +129,10 @@ impl CaptureFrame {
                 u_data,
                 v_data,
                 quant,
+                timing,
             } => {
                 *quant = None;
+                *timing = FrameTiming::default();
                 *width = new_width;
                 *height = new_height;
                 *format = new_format;
@@ -158,6 +164,22 @@ impl CaptureFrame {
             Self::Cpu { quant, .. } => *quant = value,
             #[cfg(feature = "gpu-decode")]
             Self::Gpu { quant, .. } => *quant = value,
+        }
+    }
+
+    pub fn timing(&self) -> FrameTiming {
+        match self {
+            Self::Cpu { timing, .. } => *timing,
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { timing, .. } => *timing,
+        }
+    }
+
+    pub fn set_timing(&mut self, value: FrameTiming) {
+        match self {
+            Self::Cpu { timing, .. } => *timing = value,
+            #[cfg(feature = "gpu-decode")]
+            Self::Gpu { timing, .. } => *timing = value,
         }
     }
 
@@ -369,7 +391,8 @@ fn run_test_pattern(
             }
         });
 
-        let frame = generate_test_frame(width, height, frame_index, format);
+        let mut frame = generate_test_frame(width, height, frame_index, format);
+        frame.set_timing(FrameTiming { captured: Some(loop_started), decoded: Some(Instant::now()) });
         frame_producer.write(frame);
         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
@@ -718,6 +741,10 @@ fn run_directshow_capture_inner(
                             );
                         }
 
+                        frame_producer.back_slot().set_timing(FrameTiming {
+                            captured: Some(now),
+                            decoded: Some(Instant::now()),
+                        });
                         frame_producer.publish();
                         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
@@ -822,6 +849,7 @@ fn run_directshow_capture_inner(
                 );
             }
 
+            frame.set_timing(FrameTiming { captured: Some(now), decoded: Some(Instant::now()) });
             frame_producer.publish();
             let _ = event_proxy.send_event(AppEvent::FrameReady);
 
@@ -1185,6 +1213,7 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
                 u_data: uv_data,
                 v_data: Vec::new(),
                 quant: None,
+                timing: FrameTiming::default(),
             }
         }
         PixelFormat::Yuvj422p => {
@@ -1213,6 +1242,7 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
                 u_data,
                 v_data,
                 quant: None,
+                timing: FrameTiming::default(),
             }
         }
     }

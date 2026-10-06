@@ -39,6 +39,8 @@ pub struct OverlayInfo {
     pub detailed: bool,
     pub status_message: Option<String>,
     pub status_is_alert: bool,
+    /// This PC's share of the latency (capture read to display refresh).
+    pub latency: Option<crate::latency::LatencySample>,
 }
 
 pub struct UiFrame<'a> {
@@ -401,7 +403,7 @@ fn draw_menu(
                         if draft.show_overlay {
                             ui.add(Checkbox::new(
                                 &mut draft.detailed_overlay,
-                                RichText::new("Include Scaling Filter In Overlay")
+                                RichText::new("Detailed Overlay (Filter, Latency Breakdown)")
                                     .color(COLOR_TEXT_PRIMARY),
                             ));
                         }
@@ -642,11 +644,22 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
         return None;
     }
 
+    let latency = overlay.latency.map(|l| format!("{:.1} ms", l.total()));
     match (overlay.width, overlay.height, overlay.fps) {
         (Some(width), Some(height), Some(fps)) => Some(if overlay.detailed {
-            format!("{width}x{height}\n{}\n{fps:.1} FPS", overlay.filter)
+            let mut text = format!("{width}x{height}\n{}\n{fps:.1} FPS", overlay.filter);
+            if let Some(l) = overlay.latency {
+                text.push_str(&format!(
+                    "\nLatency {:.1} ms\ndecode {:.1} · queue {:.1} · render {:.1} · vblank ~{:.1}",
+                    l.total(), l.decode, l.queue, l.render, l.vblank
+                ));
+            }
+            text
         } else {
-            format!("{width}x{height} | {fps:.1} FPS")
+            match latency {
+                Some(latency) => format!("{width}x{height} | {fps:.1} FPS | {latency}"),
+                None => format!("{width}x{height} | {fps:.1} FPS"),
+            }
         }),
         _ => Some("Waiting For Video...".to_string()),
     }
