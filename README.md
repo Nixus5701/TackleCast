@@ -1,4 +1,4 @@
-The presentation menu now includes **Mailbox (low latency, 1 frame)**, a tear-free option for fixed-refresh monitors. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
+The presentation menu includes **Mailbox (low latency)**, a tear-free option that never waits for vblank and never queues frames on the GPU. See [docs/AUDIT-AND-LATENCY.md](docs/AUDIT-AND-LATENCY.md) and [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
 
 This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
 

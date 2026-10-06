@@ -27,3 +27,4 @@ logs/
 # Launcher exe (built locally)
 TackleCast.exe
 
+tests/portable/target/

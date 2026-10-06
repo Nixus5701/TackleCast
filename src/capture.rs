@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{
-    codec, device, format, media, threading, Dictionary,
+    codec, device, format, media, threading, Dictionary, Packet,
     software::scaling::{flag::Flags as ScaleFlags, Context as ScaleContext},
     util::frame::video::Video,
 };
@@ -21,6 +21,30 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::AppEvent;
 use crate::triple_buffer::Producer;
+
+/// How long `CaptureThread::stop` waits for the capture thread to notice the
+/// stop flag. DirectShow reads block until the device delivers a frame, so a
+/// source that has gone quiet (console off, HDMI unplugged at the source) can
+/// hold the thread indefinitely. Past this point the thread is detached rather
+/// than freezing the UI; it exits on its own at the next frame, or with the
+/// process.
+const STOP_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Consecutive failed packet reads (other than "try again") after which the
+/// device is treated as lost. Unplugging a DirectShow device makes every read
+/// fail immediately with EIO.
+const MAX_CONSECUTIVE_READ_ERRORS: u32 = 100;
+
+/// Why an opened-or-attempted capture session ended.
+enum CaptureError {
+    /// The device could not be opened or decoded with these settings. The
+    /// caller moves on to the next format/resolution fallback.
+    Open(String),
+    /// The device opened and streamed, then stopped working (unplugged,
+    /// driver error). Falling back to other settings would only downgrade the
+    /// user's saved configuration, so this is reported instead.
+    Lost(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -71,14 +95,14 @@ impl CaptureFrame {
     ///
     /// `Vec::resize` is a no-op once capacity is sufficient, so a frame
     /// recycled from the triple buffer is reshaped without allocating.
-    #[cfg(feature = "gpu-decode")]
     pub fn reshape_cpu(
         &mut self,
         new_width: u32,
         new_height: u32,
         new_format: PixelFormat,
         y_len: usize,
-        uv_len: usize,
+        u_len: usize,
+        v_len: usize,
     ) -> (&mut [u8], &mut [u8], &mut [u8]) {
         if !matches!(self, Self::Cpu { .. }) {
             *self = Self::empty();
@@ -97,14 +121,15 @@ impl CaptureFrame {
                 *height = new_height;
                 *format = new_format;
                 y_data.resize(y_len, 0);
-                u_data.resize(uv_len, 0);
-                v_data.resize(uv_len, 0);
+                u_data.resize(u_len, 0);
+                v_data.resize(v_len, 0);
                 (
                     y_data.as_mut_slice(),
                     u_data.as_mut_slice(),
                     v_data.as_mut_slice(),
                 )
             }
+            #[cfg(feature = "gpu-decode")]
             Self::Gpu { .. } => unreachable!("coerced to Cpu above"),
         }
     }
@@ -266,8 +291,20 @@ impl CaptureThread {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(join_handle) = self.join_handle.take() {
+        let Some(join_handle) = self.join_handle.take() else {
+            return;
+        };
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !join_handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if join_handle.is_finished() {
             let _ = join_handle.join();
+        } else {
+            warn!(
+                "capture thread did not stop within {:?} (device is delivering no frames); detaching it",
+                STOP_TIMEOUT
+            );
         }
     }
 }
@@ -347,6 +384,7 @@ fn run_directshow_capture(
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
+    let _mmcss = crate::mmcss::MmcssRegistration::register("Capture");
     ffmpeg::log::set_level(ffmpeg::log::Level::Error);
 
     // Build list of (width, height, fps) tiers to try. Start with the
@@ -403,7 +441,12 @@ fn run_directshow_capture(
                     }
                     return;
                 }
-                Err(error) => {
+                Err(CaptureError::Lost(error)) => {
+                    warn!("capture device lost: device='{}' error={}", device_name, error);
+                    let _ = error_tx.send(error);
+                    return;
+                }
+                Err(CaptureError::Open(error)) => {
                     warn!(
                         "capture attempt failed: device='{}' format='{}' {}x{} @ {}fps error={}",
                         device_name, format_label, try_w, try_h, try_fps, error
@@ -433,9 +476,10 @@ fn run_directshow_capture_inner(
     event_proxy: &EventLoopProxy<AppEvent>,
     #[cfg(feature = "gpu-decode")]
     shared_gpu_handles: &mut Option<crate::dx12_interop::ImportHandles>,
-) -> Result<(), String> {
-    let dshow_format = find_dshow_format()
-        .ok_or_else(|| "DirectShow input format was not found in FFmpeg".to_string())?;
+) -> Result<(), CaptureError> {
+    let dshow_format = find_dshow_format().ok_or_else(|| {
+        CaptureError::Open("DirectShow input format was not found in FFmpeg".to_string())
+    })?;
     let mut options = Dictionary::new();
     options.set("video_size", &format!("{requested_width}x{requested_height}"));
     options.set("framerate", &requested_fps.to_string());
@@ -452,27 +496,31 @@ fn run_directshow_capture_inner(
 
     let url = format!("video={device_name}");
     let mut input = format::open_with(&url, &dshow_format, options)
-        .map_err(|error| format!("failed to open DirectShow input for '{device_name}': {error}"))?
+        .map_err(|error| CaptureError::Open(format!("failed to open DirectShow input for '{device_name}': {error}")))?
         .input();
 
     let input_stream = input
         .streams()
         .best(media::Type::Video)
-        .ok_or_else(|| format!("no video stream found for '{device_name}'"))?;
+        .ok_or_else(|| CaptureError::Open(format!("no video stream found for '{device_name}'")))?;
     let stream_index = input_stream.index();
     let parameters = input_stream.parameters();
 
     let mut decoder_context = codec::context::Context::from_parameters(parameters)
-        .map_err(|error| format!("failed to create decoder context: {error}"))?;
+        .map_err(|error| CaptureError::Open(format!("failed to create decoder context: {error}")))?;
+    // Slice threading, never frame threading: frame threading holds back
+    // (threads - 1) frames inside the decoder, which is pure added latency.
+    // FFmpeg's MJPEG and rawvideo decoders are single-threaded either way.
     decoder_context.set_threading(threading::Config {
-        kind: threading::Type::Frame,
+        kind: threading::Type::Slice,
         count: decode_threads.max(1),
     });
+    decoder_context.set_flags(codec::Flags::LOW_DELAY);
 
     let mut decoder = decoder_context
         .decoder()
         .video()
-        .map_err(|error| format!("failed to open video decoder: {error}"))?;
+        .map_err(|error| CaptureError::Open(format!("failed to open video decoder: {error}")))?;
 
     // Log actual stream parameters vs requested
     let actual_rate = input_stream.rate();
@@ -557,13 +605,52 @@ fn run_directshow_capture_inner(
         is_zero_copy,
     );
 
-    for (stream, packet) in input.packets() {
+    // MJPEG and raw frames are each self-contained, so when several packets
+    // are already queued only the newest is worth decoding. Codecs with
+    // inter-frame prediction (H.264 from webcams) must see every packet.
+    let drain_backlog = matches!(decoder.id(), codec::Id::MJPEG | codec::Id::RAWVIDEO);
+    let mut stale_packets_skipped = 0_u64;
+    let mut consecutive_read_errors = 0_u32;
+
+    loop {
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        if stream.index() != stream_index {
+        // Read packets directly rather than through `input.packets()`: that
+        // iterator retries every error except EOF forever, so an unplugged
+        // device (EIO on every read) spun a core at 100% and the stop flag
+        // was never checked again, hanging `CaptureThread::stop`.
+        let mut packet = Packet::empty();
+        match packet.read(&mut input) {
+            Ok(()) => consecutive_read_errors = 0,
+            Err(ffmpeg::Error::Eof) => {
+                return Err(CaptureError::Lost(format!(
+                    "capture stream from '{device_name}' ended"
+                )));
+            }
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(error) => {
+                consecutive_read_errors += 1;
+                if consecutive_read_errors >= MAX_CONSECUTIVE_READ_ERRORS {
+                    return Err(CaptureError::Lost(format!(
+                        "capture device '{device_name}' stopped responding: {error}"
+                    )));
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        }
+
+        if packet.stream() != stream_index {
             continue;
+        }
+
+        if drain_backlog {
+            stale_packets_skipped += take_newest_queued_packet(&mut input, stream_index, &mut packet);
         }
 
         // Track frame arrival timing
@@ -627,8 +714,8 @@ fn run_directshow_capture_inner(
                                 String::new()
                             };
                             info!(
-                                "decode summary: {} total frames, {:.1} avg fps (GPU), {}x{}, device='{}'{}",
-                                total_frames, avg_fps, width, height, device_name, arrival_info
+                                "decode summary: {} total frames, {:.1} avg fps (GPU), {}x{}, stale_packets_skipped={}, device='{}'{}",
+                                total_frames, avg_fps, width, height, stale_packets_skipped, device_name, arrival_info
                             );
                             last_summary_at = Instant::now();
                             summary_frame_counter = 0;
@@ -640,6 +727,12 @@ fn run_directshow_capture_inner(
                         continue; // skip software decode
                     }
                     Err(crate::gpu_decode::GpuDecodeError::Busy) => continue,
+                    Err(crate::gpu_decode::GpuDecodeError::Unsupported(reason)) => {
+                        // Every later frame would fail the same way; decode
+                        // this one and the rest in software.
+                        warn!("disabling GPU decode: {reason}");
+                        gpu_decoder = None;
+                    }
                     Err(crate::gpu_decode::GpuDecodeError::InvalidData(_)) => {
                         // Bad packet (e.g. config header) — skip to software decode
                         // for this packet, keep GPU decode active for the next one.
@@ -675,13 +768,17 @@ fn run_directshow_capture_inner(
         }
 
         while decoder.receive_frame(&mut decoded).is_ok() {
-            let frame = capture_frame_from_video(
+            // Fill the back slot in place so its plane buffers are reused
+            // rather than reallocated for every frame.
+            let frame = frame_producer.back_slot();
+            fill_frame_from_video(
                 &decoded,
                 &mut scaler,
                 &mut scaled_frame,
                 requested_fps > 60,
+                frame,
             )
-                .map_err(|error| format!("failed to convert decoded frame: {error}"))?;
+                .map_err(|error| CaptureError::Open(format!("failed to convert decoded frame: {error}")))?;
             let width = frame.width();
             let height = frame.height();
             total_frames += 1;
@@ -694,7 +791,7 @@ fn run_directshow_capture_inner(
                 );
             }
 
-            frame_producer.write(frame);
+            frame_producer.publish();
             let _ = event_proxy.send_event(AppEvent::FrameReady);
 
             stats_frame_counter += 1;
@@ -718,8 +815,8 @@ fn run_directshow_capture_inner(
                     String::new()
                 };
                 info!(
-                    "decode summary: {} total frames, {:.1} avg fps (SW), {}x{}, packet_errors={}, device='{}'{}",
-                    total_frames, avg_fps, width, height, packet_errors, device_name, arrival_info
+                    "decode summary: {} total frames, {:.1} avg fps (SW), {}x{}, packet_errors={}, stale_packets_skipped={}, device='{}'{}",
+                    total_frames, avg_fps, width, height, packet_errors, stale_packets_skipped, device_name, arrival_info
                 );
                 last_summary_at = Instant::now();
                 summary_frame_counter = 0;
@@ -730,16 +827,51 @@ fn run_directshow_capture_inner(
             }
         }
     }
-
-    Ok(())
 }
 
-fn capture_frame_from_video(
+/// Replaces `packet` with the newest packet for `stream_index` that the
+/// device has already queued, without waiting for more. Returns how many
+/// stale packets were skipped.
+///
+/// Without this, any stall (software MJPEG decode slower than the capture
+/// rate, a slow first frame, the packets `avformat_find_stream_info` buffered
+/// during startup) leaves a backlog in DirectShow's real-time buffer that is
+/// then displayed in order, permanently adding the backlog's duration to the
+/// latency. Up to `rtbufsize` (16 MB) of MJPEG is several hundred
+/// milliseconds.
+fn take_newest_queued_packet(
+    input: &mut format::context::Input,
+    stream_index: usize,
+    packet: &mut Packet,
+) -> u64 {
+    let nonblock = ffmpeg::ffi::AVFMT_FLAG_NONBLOCK as std::ffi::c_int;
+    // SAFETY: the context is valid for the lifetime of `input`, and only this
+    // thread touches it. The dshow demuxer re-reads `flags` on every call.
+    unsafe { (*input.as_mut_ptr()).flags |= nonblock };
+    let mut skipped = 0;
+    loop {
+        let mut queued = Packet::empty();
+        if queued.read(input).is_err() {
+            // EAGAIN: nothing more is queued. Any real error resurfaces on
+            // the next blocking read, which handles it.
+            break;
+        }
+        if queued.stream() == stream_index {
+            *packet = queued;
+            skipped += 1;
+        }
+    }
+    unsafe { (*input.as_mut_ptr()).flags &= !nonblock };
+    skipped
+}
+
+fn fill_frame_from_video(
     frame: &Video,
     scaler: &mut Option<ScaleContext>,
     scaled_frame: &mut Video,
     prefer_yuvj422p: bool,
-) -> Result<CaptureFrame, String> {
+    out: &mut CaptureFrame,
+) -> Result<(), String> {
     let width = frame.width();
     let height = frame.height();
 
@@ -784,14 +916,15 @@ fn capture_frame_from_video(
             scale_ctx
                 .run(frame, scaled_frame)
                 .map_err(|error| format!("failed to convert frame via swscale: {error}"))?;
-            return extract_supported_frame(scaled_frame);
+            return extract_supported_frame(scaled_frame, out);
         }
     };
 
-    extract_supported_frame_with_format(frame, format, width, height)
+    extract_supported_frame_with_format(frame, format, width, height, out);
+    Ok(())
 }
 
-fn extract_supported_frame(frame: &Video) -> Result<CaptureFrame, String> {
+fn extract_supported_frame(frame: &Video, out: &mut CaptureFrame) -> Result<(), String> {
     let width = frame.width();
     let height = frame.height();
     let format = match frame.format() {
@@ -799,33 +932,40 @@ fn extract_supported_frame(frame: &Video) -> Result<CaptureFrame, String> {
         format::Pixel::YUVJ422P => PixelFormat::Yuvj422p,
         other => return Err(format!("unsupported converted pixel format: {other:?}")),
     };
-    extract_supported_frame_with_format(frame, format, width, height)
+    extract_supported_frame_with_format(frame, format, width, height, out);
+    Ok(())
 }
 
+/// Copies the decoded planes into `out`, tightly packed. NV12 keeps its
+/// interleaved UV plane as-is; the renderer uploads it as one two-channel
+/// texture instead of splitting it on the CPU.
 fn extract_supported_frame_with_format(
     frame: &Video,
     format: PixelFormat,
     width: u32,
     height: u32,
-) -> Result<CaptureFrame, String> {
-    let y_data = copy_plane(frame, 0, width as usize, height as usize);
-    let u_data = match format {
-        PixelFormat::Nv12 => copy_plane(frame, 1, width as usize, (height / 2) as usize),
-        PixelFormat::Yuvj422p => copy_plane(frame, 1, (width / 2) as usize, height as usize),
+    out: &mut CaptureFrame,
+) {
+    let (width_px, height_px) = (width as usize, height as usize);
+    let chroma_width = (width / 2) as usize;
+    let (u_rows, u_row_bytes, v_rows) = match format {
+        // Interleaved UV: half the rows, two bytes per chroma sample.
+        PixelFormat::Nv12 => ((height / 2) as usize, chroma_width * 2, 0),
+        PixelFormat::Yuvj422p => (height_px, chroma_width, height_px),
     };
-    let v_data = match format {
-        PixelFormat::Nv12 => Vec::new(),
-        PixelFormat::Yuvj422p => copy_plane(frame, 2, (width / 2) as usize, height as usize),
-    };
-
-    Ok(CaptureFrame::Cpu {
+    let (y_data, u_data, v_data) = out.reshape_cpu(
         width,
         height,
         format,
-        y_data,
-        u_data,
-        v_data,
-    })
+        width_px * height_px,
+        u_row_bytes * u_rows,
+        chroma_width * v_rows,
+    );
+    copy_plane(frame, 0, width_px, height_px, y_data);
+    copy_plane(frame, 1, u_row_bytes, u_rows, u_data);
+    if v_rows > 0 {
+        copy_plane(frame, 2, chroma_width, v_rows, v_data);
+    }
 }
 
 /// Build an ordered list of (width, height, fps) to try. Starts with the
@@ -888,19 +1028,18 @@ fn pixel_format_attempts(requested_pixel_format: &str) -> Vec<Option<String>> {
     attempts
 }
 
-fn copy_plane(frame: &Video, plane: usize, row_bytes: usize, rows: usize) -> Vec<u8> {
+fn copy_plane(frame: &Video, plane: usize, row_bytes: usize, rows: usize, output: &mut [u8]) {
     let stride = frame.stride(plane);
     let source = frame.data(plane);
-    let mut output = vec![0_u8; row_bytes * rows];
 
-    for row in 0..rows {
-        let src_start = row * stride;
-        let dst_start = row * row_bytes;
-        output[dst_start..dst_start + row_bytes]
-            .copy_from_slice(&source[src_start..src_start + row_bytes]);
+    if stride == row_bytes {
+        output.copy_from_slice(&source[..row_bytes * rows]);
+        return;
     }
-
-    output
+    for (row, destination) in output.chunks_exact_mut(row_bytes).take(rows).enumerate() {
+        let src_start = row * stride;
+        destination.copy_from_slice(&source[src_start..src_start + row_bytes]);
+    }
 }
 
 fn find_dshow_format() -> Option<ffmpeg::Format> {

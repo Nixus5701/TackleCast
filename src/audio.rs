@@ -11,6 +11,11 @@ use crate::devices;
 
 const BUFFER_FRAMES: u32 = 256;
 const RING_BUFFER_CAPACITY: usize = 48_000 * 2;
+/// Buffered audio beyond this is trimmed back to half of it. The capture
+/// card and the output device run on independent clocks, so without a bound
+/// any drift (or the input starting before the output) accumulates in the ring
+/// as permanent extra audio latency, up to its whole capacity.
+const MAX_AUDIO_BACKLOG_MS: u32 = 40;
 
 pub struct AudioPassthrough {
     input_stream: Option<Stream>,
@@ -156,7 +161,11 @@ impl AudioPassthrough {
             input_rate
         );
 
-        let ring = Arc::new(AudioRingBuffer::new(RING_BUFFER_CAPACITY));
+        let max_backlog =
+            (input_rate as usize * channels as usize * MAX_AUDIO_BACKLOG_MS as usize) / 1000;
+        let ring = Arc::new(
+            AudioRingBuffer::new(RING_BUFFER_CAPACITY).limit_backlog(max_backlog, channels as usize),
+        );
         let input_stream = match build_input_stream(
             &input_device,
             &stream_config,
@@ -430,6 +439,11 @@ enum Direction {
 struct AudioRingBuffer {
     data: Box<[AtomicU32]>,
     capacity: usize,
+    /// Samples the reader lets accumulate before dropping the oldest.
+    max_backlog: usize,
+    /// Interleaved channel count; trims are whole frames so channels stay
+    /// aligned.
+    frame_samples: usize,
     read_index: AtomicUsize,
     write_index: AtomicUsize,
 }
@@ -441,9 +455,17 @@ impl AudioRingBuffer {
         Self {
             data: values.into_boxed_slice(),
             capacity,
+            max_backlog: capacity,
+            frame_samples: 1,
             read_index: AtomicUsize::new(0),
             write_index: AtomicUsize::new(0),
         }
+    }
+
+    fn limit_backlog(mut self, max_samples: usize, frame_samples: usize) -> Self {
+        self.frame_samples = frame_samples.max(1);
+        self.max_backlog = max_samples.clamp(self.frame_samples, self.capacity);
+        self
     }
 
     fn push_samples(&self, samples: &[f32]) -> usize {
@@ -468,7 +490,14 @@ impl AudioRingBuffer {
     fn pop_samples(&self, output: &mut [f32]) -> usize {
         let mut read = self.read_index.load(Ordering::Relaxed);
         let write = self.write_index.load(Ordering::Acquire);
-        let available = write.wrapping_sub(read);
+        let mut available = write.wrapping_sub(read);
+        if available > self.max_backlog {
+            // Only the reader moves read_index, so skipping ahead is safe.
+            let target = self.max_backlog / 2;
+            let skip = (available - target) / self.frame_samples * self.frame_samples;
+            read = read.wrapping_add(skip);
+            available -= skip;
+        }
         let count = available.min(output.len());
 
         for sample in output.iter_mut().take(count) {
@@ -477,9 +506,7 @@ impl AudioRingBuffer {
             read = read.wrapping_add(1);
         }
 
-        if count > 0 {
-            self.read_index.store(read, Ordering::Release);
-        }
+        self.read_index.store(read, Ordering::Release);
 
         count
     }
@@ -500,6 +527,18 @@ mod tests {
         assert!((out[0] - 0.1).abs() < 0.0001);
         assert!((out[1] - 0.2).abs() < 0.0001);
         assert!((out[2] - 0.3).abs() < 0.0001);
+    }
+
+    #[test]
+    fn ring_buffer_trims_backlog_to_newest_whole_frames() {
+        let ring = AudioRingBuffer::new(64).limit_backlog(8, 2);
+        let samples: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        assert_eq!(ring.push_samples(&samples), 20);
+
+        // 20 buffered > 8 allowed: keep the newest 4 samples (two stereo frames).
+        let mut out = [0.0; 8];
+        assert_eq!(ring.pop_samples(&mut out), 4);
+        assert_eq!(&out[..4], &[16.0, 17.0, 18.0, 19.0]);
     }
 
     #[test]

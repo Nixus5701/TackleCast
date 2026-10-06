@@ -2,8 +2,8 @@
 
 Extract the full Windows ZIP into a new folder and run TackleCast.exe. Open Esc > Video and choose a Presentation mode, then press Escape to close Settings and save. The setting is saved across restarts.
 
-- Mailbox (default) preserves the previous mode preference and frame-latency limit of 2.
-- Mailbox (low latency, 1 frame) uses Mailbox with a frame-latency limit of 1. It remains tear-free. If Mailbox is unsupported, this option falls back to FIFO VSync, never Immediate. It can be used with VSR enabled or disabled. Reduced queueing may help latency, but could lower throughput under heavy GPU load. The improvement has not been measured on the capture setup.
+- Mailbox (default) keeps the frame-latency limit of 2. It now falls back to FIFO VSync, never to Immediate, when Mailbox is unavailable.
+- Mailbox (low latency) — formerly "Mailbox (low latency, 1 frame)" — uses Mailbox with three swapchain buffers plus a GPU-queue gate (see [AUDIT-AND-LATENCY.md](AUDIT-AND-LATENCY.md); the earlier two-buffer version could wait for vblank before rendering a newer frame). It remains tear-free. If Mailbox is unsupported, this option falls back to FIFO VSync, never Immediate. It can be used with VSR enabled or disabled. The improvement has not been measured on the capture setup.
 - Immediate requests presentation with tearing permitted and a frame-latency limit of 1. If unsupported, the renderer uses Mailbox, then AutoVsync. Startup and mode-change logs show both requested and active modes.
 
 All modes choose the latest available capture frame after acquiring the display buffer. This prevents a frame chosen before a display wait from being unnecessarily stale when rendering starts. VSR processes the newly selected frame as before.

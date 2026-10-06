@@ -1,4 +1,4 @@
-For the new tear-free mode: **Esc > Video > Presentation mode > Mailbox (low latency, 1 frame) > Apply**.
+For the lowest-latency tear-free mode: **Esc > Video > Presentation mode > Mailbox (low latency)**, then press Escape to apply. Use F11 fullscreen for the lowest display latency. See [docs/AUDIT-AND-LATENCY.md](docs/AUDIT-AND-LATENCY.md).
 
 This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
 

@@ -10,6 +10,7 @@ mod gpu_decode;
 #[cfg(feature = "gpu-decode")]
 mod gpu_monitor;
 mod logger;
+mod mmcss;
 mod render;
 mod presentation;
 #[cfg(feature = "gpu-decode")]
@@ -127,6 +128,9 @@ fn main() {
     info!("audio inputs: {:?}", audio_inputs);
     info!("audio outputs: {:?}", audio_outputs);
 
+    // The event loop thread acquires, renders and presents every frame.
+    let _mmcss = mmcss::MmcssRegistration::register("Games");
+
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .expect("failed to create event loop");
@@ -237,10 +241,7 @@ impl App {
     ///
     /// Cheap to call often; it early-returns unless the answer changed.
     fn update_sleep_suppression(&mut self) {
-        let capture_live = self
-            .last_frame_at
-            .is_some_and(|at| at.elapsed() < CAPTURE_LIVE_TIMEOUT);
-        let should_suppress = capture_live && !self.is_minimized;
+        let should_suppress = self.capture_is_live() && !self.is_minimized;
 
         if should_suppress == self.is_sleep_suppressed {
             return;
@@ -256,6 +257,11 @@ impl App {
         unsafe {
             SetThreadExecutionState(flags);
         }
+    }
+
+    fn capture_is_live(&self) -> bool {
+        self.last_frame_at
+            .is_some_and(|at| at.elapsed() < CAPTURE_LIVE_TIMEOUT)
     }
 
     fn set_cursor_visible(&mut self, visible: bool) {
@@ -336,6 +342,12 @@ impl ApplicationHandler<AppEvent> for App {
                         if self.ui.as_ref().is_some_and(|ui| ui.is_menu_open()) {
                             self.set_cursor_visible(true);
                         }
+                        // Frames normally drive redraws; without this the menu
+                        // never appears while no video is arriving (no device,
+                        // capture error, console off).
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
 
                         return;
                     }
@@ -353,7 +365,12 @@ impl ApplicationHandler<AppEvent> for App {
         // and goes stale (wrong scale factor after a monitor change, unknown
         // pointer position) if it only sees them some of the time.
         if let Some(ui) = &mut self.ui {
-            ui.on_window_event(window, &event);
+            let repaint = ui.on_window_event(window, &event);
+            // While video is live the next frame repaints the UI anyway; an
+            // extra redraw per mouse event would only compete with it.
+            if repaint && (ui.is_menu_open() || !self.capture_is_live()) {
+                window.request_redraw();
+            }
         }
 
         match event {
@@ -429,10 +446,12 @@ impl ApplicationHandler<AppEvent> for App {
                     if toggle_fullscreen {
                         self.toggle_fullscreen();
                     }
-                    if let Some(settings) = apply_settings {
-                        self.apply_settings(settings);
-                    }
                     if exit_requested {
+                        // Keep the menu's choices, but don't restart capture or
+                        // audio with them on the way out.
+                        if let Some(settings) = apply_settings {
+                            self.settings = settings;
+                        }
                         if let Some(capture) = &mut self.capture {
                             capture.stop();
                         }
@@ -441,6 +460,8 @@ impl ApplicationHandler<AppEvent> for App {
                             error!("failed to save settings on exit: {error}");
                         }
                         event_loop.exit();
+                    } else if let Some(settings) = apply_settings {
+                        self.apply_settings(settings);
                     }
                 }
             }
@@ -482,6 +503,7 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Poll non-frame channels (stats, errors, negotiation).
         // These are low-frequency and don't need event-driven wakeup.
+        let mut status_changed = false;
         if let Some(capture) = &mut self.capture {
             if let Some(stats) = capture.latest_stats() {
                 self.latest_stats = Some(stats);
@@ -490,6 +512,7 @@ impl ApplicationHandler<AppEvent> for App {
             if let Some(error_message) = capture.latest_error() {
                 self.latest_error = Some(error_message.clone());
                 warn!("capture error: {error_message}");
+                status_changed = true;
             }
 
             // If the capture thread fell back to a different resolution/fps,
@@ -544,6 +567,14 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Let the display sleep again once frames have stopped arriving.
         self.update_sleep_suppression();
+
+        // Without incoming frames nothing else redraws, so a capture error
+        // would otherwise never reach the overlay.
+        if status_changed && !self.is_minimized {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
     }
 }
 

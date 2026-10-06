@@ -319,7 +319,7 @@ fn draw_menu(
                                     ui.selectable_value(&mut draft.presentation_mode, mode, mode.label());
                                 }
                             });
-                        ui.label(RichText::new("Low-latency Mailbox keeps presentation tear-free with a one-frame limit. Immediate permits tearing. Unsupported modes fall back automatically.").small().color(COLOR_TEXT_SECONDARY));
+                        ui.label(RichText::new("Low-latency Mailbox is tear-free: it always shows the newest frame without waiting for vblank or letting frames queue on the GPU. Immediate permits tearing. Mailbox modes fall back to VSync, never to tearing.").small().color(COLOR_TEXT_SECONDARY));
 
                         scaling_filter_combo(
                             ui,

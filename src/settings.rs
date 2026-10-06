@@ -142,12 +142,15 @@ impl PresentationMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Mailbox => "Mailbox (default)",
-            Self::MailboxLowLatency => "Mailbox (low latency, 1 frame)",
+            Self::MailboxLowLatency => "Mailbox (low latency)",
             Self::Immediate => "Immediate (lowest latency; may tear)",
         }
     }
-    pub fn frame_latency(self) -> u32 {
-        match self { Self::Mailbox => 2, Self::MailboxLowLatency | Self::Immediate => 1 }
+    /// Whether the renderer waits for the previous frame's GPU work before
+    /// starting the next, so frames can't queue on the GPU. Neither low-latency
+    /// mode wants a GPU backlog; plain Mailbox keeps the original pipelining.
+    pub fn gates_gpu_queue(self) -> bool {
+        matches!(self, Self::MailboxLowLatency | Self::Immediate)
     }
 }
 
