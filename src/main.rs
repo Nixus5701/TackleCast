@@ -68,6 +68,7 @@ pub enum AppEvent {
 enum TestPatternMode {
     Alternate,
     Nv12,
+    Nv16,
     Yuvj422p,
 }
 
@@ -84,6 +85,8 @@ impl CliArgs {
 
         let test_pattern = if has_flag("--test-nv12") {
             TestPatternMode::Nv12
+        } else if has_flag("--test-nv16") || has_flag("--test-yuy2") {
+            TestPatternMode::Nv16
         } else if has_flag("--test-yuvj422p") || has_flag("--test-mjpeg") {
             TestPatternMode::Yuvj422p
         } else {
@@ -93,6 +96,8 @@ impl CliArgs {
         let test_mode = has_flag("--test")
             || has_flag("--test-alt")
             || has_flag("--test-nv12")
+            || has_flag("--test-nv16")
+            || has_flag("--test-yuy2")
             || has_flag("--test-yuvj422p")
             || has_flag("--test-mjpeg");
 
@@ -736,6 +741,7 @@ impl App {
         let (alternate_formats, force_format) = match self.test_pattern {
             TestPatternMode::Alternate => (true, None),
             TestPatternMode::Nv12 => (false, Some(PixelFormat::Nv12)),
+            TestPatternMode::Nv16 => (false, Some(PixelFormat::Nv16)),
             TestPatternMode::Yuvj422p => (false, Some(PixelFormat::Yuvj422p)),
         };
 

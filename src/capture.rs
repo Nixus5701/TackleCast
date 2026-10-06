@@ -50,6 +50,9 @@ enum CaptureError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     Nv12,
+    /// Limited-range 4:2:2 with interleaved chroma (Y plane + UV plane at
+    /// half width, full height). Uncompressed YUY2/UYVY capture lands here.
+    Nv16,
     Yuvj422p,
 }
 
@@ -906,6 +909,12 @@ fn fill_frame_from_video(
     let format = match frame.format() {
         format::Pixel::NV12 => PixelFormat::Nv12,
         format::Pixel::YUVJ422P => PixelFormat::Yuvj422p,
+        // Packed 4:2:2 is split straight into Y and UV planes, keeping full
+        // chroma resolution. (swscale to NV12 would halve it and cost a pass.)
+        format::Pixel::YUYV422 | format::Pixel::UYVY422 => {
+            split_packed_422(frame, frame.format() == format::Pixel::YUYV422, out);
+            return Ok(());
+        }
         other => {
             let target = if prefer_yuvj422p {
                 format::Pixel::YUVJ422P
@@ -979,6 +988,7 @@ fn extract_supported_frame_with_format(
     let (u_rows, u_row_bytes, v_rows) = match format {
         // Interleaved UV: half the rows, two bytes per chroma sample.
         PixelFormat::Nv12 => ((height / 2) as usize, chroma_width * 2, 0),
+        PixelFormat::Nv16 => (height_px, chroma_width * 2, 0),
         PixelFormat::Yuvj422p => (height_px, chroma_width, height_px),
     };
     let (y_data, u_data, v_data) = out.reshape_cpu(
@@ -1047,13 +1057,63 @@ fn pixel_format_attempts(requested_pixel_format: &str) -> Vec<Option<String>> {
     };
 
     push_unique(Some(requested_pixel_format));
-    push_unique(Some("mjpeg"));
-    push_unique(Some("nv12"));
-    push_unique(Some("yuyv422"));
-    push_unique(Some("uyvy422"));
+    if requested_pixel_format.eq_ignore_ascii_case("mjpeg") {
+        // High frame rates that only fit USB bandwidth compressed.
+        push_unique(Some("nv12"));
+        push_unique(Some("yuyv422"));
+        push_unique(Some("uyvy422"));
+    } else {
+        // Uncompressed first: MJPEG adds blocking and ringing, so it is only
+        // the last resort before letting the device choose.
+        push_unique(Some("nv12"));
+        push_unique(Some("yuyv422"));
+        push_unique(Some("uyvy422"));
+        push_unique(Some("yuv420p"));
+        push_unique(Some("mjpeg"));
+    }
     push_unique(Some("yuv420p"));
+    push_unique(Some("mjpeg"));
     push_unique(None);
     attempts
+}
+
+/// Splits packed 4:2:2 (YUYV or UYVY) into a Y plane and an interleaved UV
+/// plane, in the same single copy that would otherwise just repack it.
+fn split_packed_422(frame: &Video, luma_first: bool, out: &mut CaptureFrame) {
+    let (width, height) = (frame.width(), frame.height());
+    let pairs = (width / 2) as usize;
+    let (y_data, uv_data, _) = out.reshape_cpu(
+        width,
+        height,
+        PixelFormat::Nv16,
+        pairs * 2 * height as usize,
+        pairs * 2 * height as usize,
+        0,
+    );
+    let stride = frame.stride(0);
+    let source = frame.data(0);
+    for row in 0..height as usize {
+        let packed = &source[row * stride..row * stride + pairs * 4];
+        let luma = &mut y_data[row * pairs * 2..(row + 1) * pairs * 2];
+        let chroma = &mut uv_data[row * pairs * 2..(row + 1) * pairs * 2];
+        split_packed_row(packed, luma_first, luma, chroma);
+    }
+}
+
+/// One row of packed 4:2:2: each 4 bytes hold two luma samples and one U/V
+/// pair (YUYV: Y0 U Y1 V; UYVY: U Y0 V Y1).
+fn split_packed_row(packed: &[u8], luma_first: bool, luma: &mut [u8], chroma: &mut [u8]) {
+    let (l, c) = if luma_first { (0, 1) } else { (1, 0) };
+    for ((group, y), uv) in packed
+        .chunks_exact(4)
+        .zip(luma.chunks_exact_mut(2))
+        .zip(chroma.chunks_exact_mut(2))
+    {
+        y[0] = group[l];
+        y[1] = group[l + 2];
+        uv[0] = group[c];
+        uv[1] = group[c + 2];
+    }
 }
 
 fn copy_plane(frame: &Video, plane: usize, row_bytes: usize, rows: usize, output: &mut [u8]) {
@@ -1100,15 +1160,16 @@ fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelF
     }
 
     match format {
-        PixelFormat::Nv12 => {
-            let mut uv_data = vec![0_u8; chroma_width * chroma_height_420 * 2];
-            for y in 0..chroma_height_420 {
+        PixelFormat::Nv12 | PixelFormat::Nv16 => {
+            let chroma_rows = if format == PixelFormat::Nv12 { chroma_height_420 } else { chroma_height_422 };
+            let mut uv_data = vec![0_u8; chroma_width * chroma_rows * 2];
+            for y in 0..chroma_rows {
                 for x in 0..chroma_width {
                     let index = (y * chroma_width + x) * 2;
                     let x_phase = ((x as f32 / chroma_width as f32) * PI * 2.0
                         + frame_index as f32 * 0.03)
                         .sin();
-                    let y_phase = ((y as f32 / chroma_height_420 as f32) * PI * 2.0
+                    let y_phase = ((y as f32 / chroma_rows as f32) * PI * 2.0
                         + frame_index as f32 * 0.05)
                         .cos();
                     uv_data[index] = ((x_phase * 0.5 + 0.5) * 255.0) as u8;
@@ -1181,6 +1242,34 @@ mod tests {
         assert_eq!(y_data.len(), 1280 * 720);
         assert_eq!(u_data.len(), 640 * 720);
         assert_eq!(v_data.len(), 640 * 720);
+    }
+
+    #[test]
+    fn uncompressed_formats_are_tried_before_mjpeg() {
+        let labels: Vec<_> = pixel_format_attempts("nv12")
+            .into_iter()
+            .map(|s| s.unwrap_or_else(|| "auto".into()))
+            .collect();
+        assert_eq!(labels, ["nv12", "yuyv422", "uyvy422", "yuv420p", "mjpeg", "auto"]);
+        let high_rate: Vec<_> = pixel_format_attempts("mjpeg")
+            .into_iter()
+            .map(|s| s.unwrap_or_else(|| "auto".into()))
+            .collect();
+        assert_eq!(high_rate[0], "mjpeg");
+    }
+
+    #[test]
+    fn packed_422_rows_split_into_luma_and_interleaved_chroma() {
+        let packed = [10, 20, 11, 30, 12, 21, 13, 31]; // Y0 U0 Y1 V0 Y2 U1 Y3 V1
+        let (mut y, mut uv) = ([0; 4], [0; 4]);
+        split_packed_row(&packed, true, &mut y, &mut uv);
+        assert_eq!(y, [10, 11, 12, 13]);
+        assert_eq!(uv, [20, 30, 21, 31]);
+        let uyvy = [20, 10, 30, 11]; // U0 Y0 V0 Y1
+        let (mut y, mut uv) = ([0; 2], [0; 2]);
+        split_packed_row(&uyvy, false, &mut y, &mut uv);
+        assert_eq!(y, [10, 11]);
+        assert_eq!(uv, [20, 30]);
     }
 
     #[test]

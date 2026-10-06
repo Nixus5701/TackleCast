@@ -506,6 +506,9 @@ impl Renderer {
                 // and V from green.
                 upload_plane(&self.queue, &video_frame.u_texture, width / 2, height / 2, 2, u_data);
             }
+            PixelFormat::Nv16 => {
+                upload_plane(&self.queue, &video_frame.u_texture, width / 2, height, 2, u_data);
+            }
             PixelFormat::Yuvj422p => {
                 upload_plane(&self.queue, &video_frame.u_texture, width / 2, height, 1, u_data);
                 upload_plane(&self.queue, &video_frame.v_texture, width / 2, height, 1, v_data);
@@ -875,7 +878,9 @@ impl VideoUniforms {
     /// Returns just the format_mode value for a partial buffer write at offset 0.
     fn format_mode_for(format: PixelFormat) -> u32 {
         match format {
-            PixelFormat::Nv12 => 0,
+            // Limited range, interleaved chroma; the shader reads chroma
+            // size from the texture, so 4:2:0 and 4:2:2 share this mode.
+            PixelFormat::Nv12 | PixelFormat::Nv16 => 0,
             PixelFormat::Yuvj422p => 1,
         }
     }
@@ -917,8 +922,9 @@ impl VideoFrameResources {
         let y_texture = create_plane_texture(device, width, height, wgpu::TextureFormat::R8Unorm, "y");
         let (u_texture, v_texture) = match format {
             // One interleaved UV texture serves as both chroma bindings.
-            PixelFormat::Nv12 => {
-                let uv = create_plane_texture(device, width / 2, height / 2,
+            PixelFormat::Nv12 | PixelFormat::Nv16 => {
+                let chroma_height = if format == PixelFormat::Nv12 { height / 2 } else { height };
+                let uv = create_plane_texture(device, width / 2, chroma_height,
                                               wgpu::TextureFormat::Rg8Unorm, "uv");
                 (uv.clone(), uv)
             }

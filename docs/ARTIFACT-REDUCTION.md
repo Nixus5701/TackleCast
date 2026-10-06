@@ -38,3 +38,11 @@ The filter adds one compute pass per plane, every captured frame, with about 9 d
 - The quality estimate matched the encoder's setting exactly at 50, 75 and 90.
 - Portable tests cover the quantization-table parser (zigzag order, per-component table selection, 16-bit tables, truncated input), the shader's validity and its uniform layout.
 - The Windows build type-checks. It has not been run on a capture card.
+
+## Avoiding compression altogether (60 fps and below)
+
+The best fix for MJPEG artifacts is not to receive MJPEG. At 60 fps and below, TackleCast now tries every uncompressed format before MJPEG: NV12, then YUY2/UYVY, then yuv420p. Before this change, a card without NV12 at the chosen mode was switched straight to MJPEG.
+
+YUY2 and UYVY are uncompressed 4:2:2. They are split straight into a luma plane and an interleaved chroma plane (`PixelFormat::Nv16`) in the single copy the capture thread already makes. Nothing is converted on the CPU, and the full 4:2:2 colour resolution is kept, twice NV12's. The renderer samples it with the same limited-range path as NV12. This needs about 250 MB/s at 1080p60, so the card must be on a USB 3 link.
+
+To check which path is active, look at the status line under the artifact reduction slider. It reads "Inactive: capture is not MJPEG" for uncompressed capture. The log line `capture thread opened DirectShow stream … using yuyv422` names the format. Run with `--test-nv16` to see a 4:2:2 test pattern.
