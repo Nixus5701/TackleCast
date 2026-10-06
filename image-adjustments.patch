@@ -1,0 +1,896 @@
+--- a/docs/LATENCY-UPDATE.md
++++ b/docs/LATENCY-UPDATE.md
+@@ -1,6 +1,6 @@
+ # Capture latency update
+ 
+-Extract the full Windows ZIP into a new folder and run TackleCast.exe. Open Esc > Video and choose a Presentation mode, then use the menu's Apply action. The setting is saved across restarts.
++Extract the full Windows ZIP into a new folder and run TackleCast.exe. Open Esc > Video and choose a Presentation mode, then press Escape to close Settings and save. The setting is saved across restarts.
+ 
+ - Mailbox (default) preserves the previous mode preference and frame-latency limit of 2.
+ - Mailbox (low latency, 1 frame) uses Mailbox with a frame-latency limit of 1. It remains tear-free. If Mailbox is unsupported, this option falls back to FIFO VSync, never Immediate. It can be used with VSR enabled or disabled. Reduced queueing may help latency, but could lower throughput under heavy GPU load. The improvement has not been measured on the capture setup.
+--- a/scripts/build_rtx.ps1
++++ b/scripts/build_rtx.ps1
+@@ -65,6 +65,7 @@
+     Copy-Item 'LICENSE' $destination -Force
+     Copy-Item 'docs\RTX-SUPER-RESOLUTION.md' $destination -Force
+     Copy-Item 'docs\LATENCY-UPDATE.md' $destination -Force
++    Copy-Item 'docs\IMAGE-ADJUSTMENTS.md' $destination -Force
+     Write-Host "Build complete: $destination\TackleCast.exe"
+     Write-Host 'For GPU MJPEG decoding, include nvjpeg64_13.dll and cudart64_13.dll from the original TackleCast package or CUDA installation.'
+     Write-Host 'Enable NVIDIA RTX Video Super Resolution, then Esc > Video > Request Super Resolution in TackleCast.'
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -210,58 +210,26 @@
+     }
+ 
+     fn create_window(event_loop: &ActiveEventLoop) -> Window {
+-        let window = event_loop
+-            .create_window(
+-                WindowAttributes::default()
+-                    .with_title(WINDOW_TITLE)
+-                    .with_resizable(true)
+-                    .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
+-            )
+-            .expect("failed to create window");
+-
+-        // Apply window icon from exe resources
+-        unsafe {
+-            use windows::core::PCWSTR;
+-            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+-            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+-            use windows::Win32::UI::WindowsAndMessaging::{
+-                LoadImageW, SendMessageW, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+-                ICON_BIG, ICON_SMALL, WM_SETICON,
+-            };
+-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+-
+-            // 1. Fetch the HWND from winit's HasWindowHandle structure
+-            let handle_abstract = window.window_handle().expect("Failed to read window handle");
+-            if let RawWindowHandle::Win32(win32_handle) = handle_abstract.as_raw() {
+-                let hwnd = HWND(win32_handle.hwnd.get() as *mut std::ffi::c_void);
+-
+-                // 2. Fetch current module instance handle
+-                let h_instance = GetModuleHandleW(None).unwrap_or_default();
+-
+-                // 3. Map numeric ID 1 assigned by winresource into PCWSTR
+-                let icon_name = PCWSTR(std::ptr::without_provenance(1));
+-
+-                // 4. Load the embedded icon layout
+-                if let Ok(handle) = LoadImageW(
+-                    h_instance,
+-                    icon_name,
+-                    IMAGE_ICON,
+-                    0, // Allow OS to handle ideal bounds sampling
+-                    0,
+-                    LR_DEFAULTSIZE | LR_SHARED,
+-                ) {
+-                    let h_icon = HICON(handle.0);
+-
+-                    if !h_icon.is_invalid() {
+-                        // 5. Send messages to assign to taskbar and titlebar context
+-                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(h_icon.0 as isize));
+-                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(h_icon.0 as isize));
+-                    }
+-                }
+-            }
+-        }
+-
+-        window
++        // Decode the same ICO that build.rs embeds into the executable.
++        let icon = image::load_from_memory_with_format(
++            include_bytes!("../assets/icon.ico"), image::ImageFormat::Ico,
++        ).map_err(|e| e.to_string()).and_then(|image| {
++            let rgba = image.into_rgba8();
++            let (width, height) = rgba.dimensions();
++            winit::window::Icon::from_rgba(rgba.into_raw(), width, height)
++                .map_err(|e| e.to_string())
++        }).map_err(|e| tracing::warn!("Failed to load window icon: {e}")).ok();
++        let attributes = WindowAttributes::default()
++            .with_title(WINDOW_TITLE)
++            .with_resizable(true)
++            .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
++            .with_window_icon(icon.clone());
++        #[cfg(windows)]
++        let attributes = {
++            use winit::platform::windows::WindowAttributesExtWindows;
++            attributes.with_taskbar_icon(icon)
++        };
++        event_loop.create_window(attributes).expect("failed to create window")
+     }
+ 
+     /// Recomputes whether the display should be held awake and pushes the
+@@ -320,6 +288,7 @@
+             self.settings.scaling_filter,
+             self.settings.request_super_resolution,
+             self.settings.presentation_mode,
++            self.settings.image_adjustments,
+         )) {
+             Ok(renderer) => renderer,
+             Err(error) => {
+@@ -395,6 +364,9 @@
+ 
+         match event {
+             WindowEvent::CloseRequested => {
++                if let Some(settings) = self.ui.as_mut().and_then(UiState::close_menu_and_apply) {
++                    self.settings = settings;
++                }
+                 if let Some(capture) = &mut self.capture {
+                     capture.stop();
+                 }
+@@ -447,6 +419,9 @@
+                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
+                     let exit_requested = prepared_ui.output.exit_requested;
+                     let apply_settings = prepared_ui.output.apply_settings.clone();
++                    if let Some(adjustments) = prepared_ui.output.image_preview {
++                        renderer.set_image_adjustments(adjustments);
++                    }
+                     match renderer.render(Some(prepared_ui), self.capture.as_mut()) {
+                         Ok(true) => {
+                             self.latest_error = None;
+@@ -624,6 +599,10 @@
+             }
+         }
+ 
++        if let Some(renderer) = &mut self.renderer {
++            renderer.set_image_adjustments(self.settings.image_adjustments);
++        }
++
+         if scaling_changed {
+             if let Some(renderer) = &mut self.renderer {
+                 renderer.set_scale_filter(self.settings.scaling_filter);
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1,7 +1,8 @@
+ #![allow(clippy::items_after_test_module)]
+ 
+ use crate::capture::{CaptureFrame, CaptureThread, PixelFormat};
+-use crate::settings::{ScaleFilter, PresentationMode};
++use crate::settings::{ScaleFilter, PresentationMode, ImageAdjustments};
++use wgpu::util::DeviceExt;
+ use crate::presentation::choose_present_mode;
+ use crate::ui::PreparedUi;
+ use bytemuck::{Pod, Zeroable};
+@@ -41,6 +42,8 @@
+     video_bind_group_layout: wgpu::BindGroupLayout,
+     video_samplers: VideoSamplers,
+     uniforms: wgpu::Buffer,
++    image_uniforms: wgpu::Buffer,
++    image_adjustments: ImageAdjustments,
+     scale_filter: ScaleFilter,
+     video_frame: Option<VideoFrameResources>,
+     egui_renderer: EguiRenderer,
+@@ -62,6 +65,7 @@
+         scale_filter: ScaleFilter,
+         request_super_resolution: bool,
+         presentation_mode: PresentationMode,
++        image_adjustments: ImageAdjustments,
+     ) -> Result<Self, RenderError> {
+         let size = window.inner_size();
+         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
+@@ -129,6 +133,7 @@
+             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                 label: Some("tacklecast-video-bind-group-layout"),
+                 entries: &[
++                    image_uniform_layout_entry(6),
+                     texture_layout_entry(0),
+                     texture_layout_entry(1),
+                     texture_layout_entry(2),
+@@ -164,9 +169,16 @@
+             mapped_at_creation: false,
+         });
+ 
++        let image_adjustments = image_adjustments.sanitized();
++        let image_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++            label: Some("image-adjustments"),
++            contents: bytemuck::cast_slice(&image_adjustments.uniforms()),
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++        });
++
+         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("tacklecast-video-shader"),
+-            source: wgpu::ShaderSource::Wgsl(VIDEO_SHADER.into()),
++            source: wgpu::ShaderSource::Wgsl(image_shader_source(VIDEO_SHADER).into()),
+         });
+ 
+         let video_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+@@ -245,6 +257,8 @@
+                 nearest: nearest_sampler,
+             },
+             uniforms,
++            image_uniforms,
++            image_adjustments,
+             scale_filter,
+             video_frame: None,
+             egui_renderer,
+@@ -312,7 +326,7 @@
+                 // Tear down the old bridge before allocating its replacement.
+                 self.vsr = None;
+                 match vsr::VsrRender::new(&self.device, &self.queue, frame,
+-                    &self.video_bind_group_layout, &self.video_samplers, self.config.format, dimensions) {
++                    &self.video_bind_group_layout, &self.video_samplers, &self.image_uniforms, self.config.format, dimensions) {
+                     Ok(v) => { self.vsr = Some(v); }
+                     Err(error) => {
+                         tracing::warn!("RTX Super Resolution unavailable: {error}");
+@@ -350,6 +364,14 @@
+         }
+     }
+ 
++    pub fn set_image_adjustments(&mut self, adjustments: ImageAdjustments) {
++        let adjustments = adjustments.sanitized();
++        if self.image_adjustments != adjustments {
++            self.image_adjustments = adjustments;
++            self.queue.write_buffer(&self.image_uniforms, 0, bytemuck::cast_slice(&adjustments.uniforms()));
++        }
++    }
++
+     pub fn set_presentation_mode(&mut self, mode: PresentationMode) {
+         self.config.present_mode = choose_present_mode(mode, &self.presentation_modes);
+         self.config.desired_maximum_frame_latency = mode.frame_latency();
+@@ -410,6 +432,7 @@
+                 &self.video_bind_group_layout,
+                 &self.video_samplers,
+                 &self.uniforms,
++                &self.image_uniforms,
+                 width,
+                 height,
+                 format,
+@@ -524,6 +547,7 @@
+                 &self.video_bind_group_layout,
+                 &self.video_samplers,
+                 &self.uniforms,
++                &self.image_uniforms,
+                 width,
+                 height,
+                 format,
+@@ -851,6 +875,7 @@
+         layout: &wgpu::BindGroupLayout,
+         samplers: &VideoSamplers,
+         uniforms: &wgpu::Buffer,
++        image_uniforms: &wgpu::Buffer,
+         width: u32,
+         height: u32,
+         format: PixelFormat,
+@@ -863,7 +888,7 @@
+         let u_texture = create_plane_texture(device, chroma_width, chroma_height, "u");
+         let v_texture = create_plane_texture(device, chroma_width, chroma_height, "v");
+ 
+-        let bind_group = video_bind_group(device, layout, samplers, uniforms,
++        let bind_group = video_bind_group(device, layout, samplers, uniforms, image_uniforms,
+                                            &y_texture, &u_texture, &v_texture);
+ 
+         Self {
+@@ -879,7 +904,7 @@
+ }
+ 
+ fn video_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
+-                    samplers: &VideoSamplers, uniforms: &wgpu::Buffer,
++                    samplers: &VideoSamplers, uniforms: &wgpu::Buffer, image_uniforms: &wgpu::Buffer,
+                     y_texture: &wgpu::Texture, u_texture: &wgpu::Texture,
+                     v_texture: &wgpu::Texture) -> wgpu::BindGroup {
+         let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+@@ -890,6 +915,7 @@
+             label: Some("tacklecast-video-bind-group"),
+             layout,
+             entries: &[
++                wgpu::BindGroupEntry { binding: 6, resource: image_uniforms.as_entire_binding() },
+                 wgpu::BindGroupEntry {
+                     binding: 0,
+                     resource: wgpu::BindingResource::TextureView(&y_view),
+@@ -1112,6 +1138,19 @@
+     }
+ }
+ 
++const IMAGE_ADJUSTMENT_SHADER: &str = include_str!("render/image_adjustments.wgsl");
++fn image_shader_source(body: &str) -> String {
++    format!("{IMAGE_ADJUSTMENT_SHADER}\n{body}")
++}
++fn image_uniform_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
++    wgpu::BindGroupLayoutEntry {
++        binding, visibility: wgpu::ShaderStages::FRAGMENT,
++        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
++            has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(32) },
++        count: None,
++    }
++}
++
+ const VIDEO_SHADER: &str = r#"
+ struct VideoUniforms {
+     format_mode: u32,
+@@ -1126,6 +1165,7 @@
+ @group(0) @binding(3) var tex_sampler: sampler;
+ @group(0) @binding(4) var<uniform> uniforms: VideoUniforms;
+ @group(0) @binding(5) var nearest_sampler: sampler;
++@group(0) @binding(6) var<uniform> image_params: ImageParams;
+ 
+ struct VertexOut {
+     @builtin(position) position: vec4<f32>,
+@@ -1368,7 +1408,7 @@
+     } else {
+         rgb = sample_yuvj422p(in.uv);
+     }
+-    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
++    return vec4<f32>(adjust_color(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), image_params), 1.0);
+ }
+ "#;
+ 
+--- a/src/render/vsr.rs
++++ b/src/render/vsr.rs
+@@ -19,6 +19,7 @@
+ impl VsrRender {
+     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: &VideoFrameResources,
+                source_layout: &wgpu::BindGroupLayout, samplers: &VideoSamplers,
++               image_uniforms: &wgpu::Buffer,
+                target_format: wgpu::TextureFormat, dimensions: Dimensions) -> Result<Self, String> {
+         let dimensions = dimensions.validate().map_err(str::to_owned)?;
+         let bridge = Bridge::new(device, queue, dimensions)?;
+@@ -36,12 +37,19 @@
+             }),
+             usage: wgpu::BufferUsages::UNIFORM,
+         });
+-        let source_bind_group = video_bind_group(device, source_layout, samplers, &uniforms,
++        // Keep the NVIDIA input neutral; apply user adjustments only once, at display.
++        let neutral_image_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++            label: Some("rtx-vsr-neutral-image-controls"),
++            contents: bytemuck::cast_slice(&ImageAdjustments::default().uniforms()),
++            usage: wgpu::BufferUsages::UNIFORM,
++        });
++        let source_bind_group = video_bind_group(device, source_layout, samplers, &uniforms, &neutral_image_uniforms,
+             &frame.y_texture, &frame.u_texture, &frame.v_texture);
+         let source_pipeline = pipeline(device, source_layout, VIDEO_SHADER, wgpu::TextureFormat::Bgra8Unorm);
+         let output_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+             label: Some("rtx-vsr-display-layout"),
+             entries: &[
++                image_uniform_layout_entry(2),
+                 texture_layout_entry(0),
+                 wgpu::BindGroupLayoutEntry {
+                     binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+@@ -53,6 +61,7 @@
+         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+             label: Some("rtx-vsr-display-bind-group"), layout: &output_layout,
+             entries: &[
++                wgpu::BindGroupEntry { binding: 2, resource: image_uniforms.as_entire_binding() },
+                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&enhanced_view) },
+                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&samplers.filtering) },
+             ],
+@@ -122,7 +131,7 @@
+ fn pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
+             source: &str, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+-        label: Some("rtx-vsr-shader"), source: wgpu::ShaderSource::Wgsl(source.into()),
++        label: Some("rtx-vsr-shader"), source: wgpu::ShaderSource::Wgsl(image_shader_source(source).into()),
+     });
+     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+         label: Some("rtx-vsr-pipeline-layout"), bind_group_layouts: &[layout], push_constant_ranges: &[],
+@@ -143,6 +152,7 @@
+ const DISPLAY_SHADER: &str = r#"
+ @group(0) @binding(0) var image: texture_2d<f32>;
+ @group(0) @binding(1) var image_sampler: sampler;
++@group(0) @binding(2) var<uniform> image_params: ImageParams;
+ struct Vertex { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+ @vertex fn vs_main(@builtin(vertex_index) i: u32) -> Vertex {
+     var positions = array<vec2<f32>, 6>(
+@@ -155,6 +165,23 @@
+     return v;
+ }
+ @fragment fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
+-    return textureSample(image, image_sampler, v.uv);
++    var rgb = textureSampleLevel(image, image_sampler, v.uv, 0.0).rgb;
++    let amount = image_params.vsr_detail;
++    if amount != 0.0 {
++        let texel = 1.0 / vec2<f32>(textureDimensions(image));
++        // 3x3 Gaussian: soften below midpoint, unsharp mask above midpoint.
++        var blur = rgb * 4.0;
++        for (var y = -1; y <= 1; y += 1) {
++            for (var x = -1; x <= 1; x += 1) {
++                if x == 0 && y == 0 { continue; }
++                let weight = select(1.0, 2.0, x == 0 || y == 0);
++                blur += weight * textureSampleLevel(image, image_sampler,
++                    v.uv + vec2<f32>(f32(x), f32(y)) * texel, 0.0).rgb;
++            }
++        }
++        blur /= 16.0;
++        rgb = clamp(rgb + amount * (rgb - blur), vec3<f32>(0.0), vec3<f32>(1.0));
++    }
++    return vec4<f32>(adjust_color(rgb, image_params), 1.0);
+ }
+ "#;
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -16,6 +16,8 @@
+ pub struct Settings {
+     #[serde(default)]
+     pub presentation_mode: PresentationMode,
++    #[serde(default)]
++    pub image_adjustments: ImageAdjustments,
+     #[serde(default)]
+     pub video_device: String,
+     #[serde(default = "default_scaling_filter")]
+@@ -43,6 +45,46 @@
+     pub detailed_overlay: bool,
+ }
+ 
++/// Display controls; sharpness is a post-VSR filter, not a driver parameter.
++#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct ImageAdjustments {
++    pub vsr_sharpness: f32,
++    pub brightness: f32,
++    pub contrast: f32,
++    pub saturation: f32,
++    pub hue: f32,
++    pub gamma: f32,
++}
++impl Default for ImageAdjustments {
++    fn default() -> Self {
++        Self { vsr_sharpness: 50.0, brightness: 0.0, contrast: 100.0,
++               saturation: 100.0, hue: 0.0, gamma: 1.0 }
++    }
++}
++impl ImageAdjustments {
++    pub fn sanitized(self) -> Self {
++        fn limit(v: f32, low: f32, high: f32, fallback: f32) -> f32 {
++            if v.is_finite() { v.clamp(low, high) } else { fallback }
++        }
++        Self {
++            vsr_sharpness: limit(self.vsr_sharpness, 0.0, 100.0, 50.0),
++            brightness: limit(self.brightness, -100.0, 100.0, 0.0),
++            contrast: limit(self.contrast, 0.0, 200.0, 100.0),
++            saturation: limit(self.saturation, 0.0, 200.0, 100.0),
++            hue: limit(self.hue, -180.0, 180.0, 0.0),
++            gamma: limit(self.gamma, 0.25, 3.0, 1.0),
++        }
++    }
++    /// Eight scalars, matching the 32-byte ImageParams WGSL uniform.
++    pub fn uniforms(self) -> [f32; 8] {
++        let p = self.sanitized();
++        let (sin, cos) = p.hue.to_radians().sin_cos();
++        [p.brightness / 100.0, p.contrast / 100.0, p.saturation / 100.0,
++         p.gamma, cos, sin, (p.vsr_sharpness - 50.0) / 50.0, 0.0]
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct CaptureConfig {
+     pub width: u32,
+@@ -113,6 +155,7 @@
+     fn default() -> Self {
+         Self {
+             presentation_mode: PresentationMode::default(),
++            image_adjustments: ImageAdjustments::default(),
+             video_device: String::new(),
+             scaling_filter: default_scaling_filter(),
+             request_super_resolution: false,
+@@ -135,7 +178,9 @@
+             return Self::default();
+         };
+ 
+-        serde_json::from_str(&raw).unwrap_or_default()
++        let mut settings: Self = serde_json::from_str(&raw).unwrap_or_default();
++        settings.image_adjustments = settings.image_adjustments.sanitized();
++        settings
+     }
+ 
+     pub fn save(&self) -> std::io::Result<()> {
+@@ -257,6 +302,30 @@
+     use super::*;
+ 
+     #[test]
++    fn image_controls_migrate_and_round_trip() {
++        let old: Settings = serde_json::from_str("{}").unwrap();
++        assert_eq!(old.image_adjustments.uniforms(), [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
++        let partial: Settings = serde_json::from_str(r#"{"image_adjustments":{"vsr_sharpness":20.0}}"#).unwrap();
++        assert_eq!(partial.image_adjustments.gamma, 1.0);
++        assert_eq!(partial.image_adjustments.contrast, 100.0);
++        let p = ImageAdjustments { vsr_sharpness: 20.0, brightness: -12.0, contrast: 115.0,
++            saturation: 90.0, hue: 25.0, gamma: 1.2 };
++        let settings = Settings { image_adjustments: p, ..Settings::default() };
++        let decoded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
++        assert_eq!(decoded.image_adjustments, p);
++    }
++
++    #[test]
++    fn invalid_image_controls_cannot_send_nonfinite_values_to_gpu() {
++        let bad = ImageAdjustments { vsr_sharpness: -400.0, brightness: f32::NAN,
++            contrast: f32::INFINITY, saturation: -5.0, hue: 500.0, gamma: 0.0 };
++        let p = bad.sanitized();
++        assert_eq!(p, ImageAdjustments { vsr_sharpness: 0.0, brightness: 0.0,
++            contrast: 100.0, saturation: 0.0, hue: 180.0, gamma: 0.25 });
++        assert!(bad.uniforms().iter().all(|v| v.is_finite()));
++    }
++
++    #[test]
+     fn default_settings_round_trip() {
+         let settings = Settings::default();
+         let json = serde_json::to_string_pretty(&settings).unwrap();
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -1,5 +1,5 @@
+ use crate::devices::AudioDevice;
+-use crate::settings::{Settings, ScaleFilter, PresentationMode, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
++use crate::settings::{Settings, ImageAdjustments, ScaleFilter, PresentationMode, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
+ use egui::{
+     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
+     Margin, RichText, Slider, Stroke,
+@@ -60,6 +60,7 @@
+ 
+ #[derive(Default)]
+ pub struct UiOutput {
++    pub image_preview: Option<ImageAdjustments>,
+     pub apply_settings: Option<Settings>,
+     pub toggle_fullscreen: bool,
+     pub exit_requested: bool,
+@@ -119,7 +120,7 @@
+             raw_input.events.retain(|event| {
+                 !matches!(
+                     event,
+-                    egui::Event::MouseWheel { .. } | egui::Event::Zoom(_)
++                    egui::Event::Zoom(_)
+                 )
+             });
+         }
+@@ -143,6 +144,9 @@
+         self.egui_winit
+             .handle_platform_output(window, full_output.platform_output);
+ 
++        if self.menu_open {
++            ui_output.image_preview = Some(self.draft_settings.image_adjustments);
++        }
+         if ui_output.apply_settings.is_some() {
+             self.menu_open = false;
+         }
+@@ -274,7 +278,9 @@
+                     ui.spacing_mut().item_spacing = egui::vec2(10.0 * text_scale, 10.0 * text_scale);
+                     ui.spacing_mut().button_padding =
+                         egui::vec2(12.0 * text_scale, 8.0 * text_scale);
+-                    ui.vertical(|ui| {
++                    egui::ScrollArea::vertical()
++                        .max_height((screen_rect.height() - 72.0).max(80.0))
++                        .show(ui, |ui| {
+                         ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                             ui.label(
+                                 RichText::new("Settings")
+@@ -327,6 +333,23 @@
+                         if draft.request_super_resolution {
+                             ui.label(RichText::new(super_resolution_status).small().color(COLOR_TEXT_SECONDARY));
+                         }
++
++                        ui.add_enabled(draft.request_super_resolution,
++                            Slider::new(&mut draft.image_adjustments.vsr_sharpness, 0.0..=100.0)
++                                .text("VSR sharpness").suffix("%").step_by(1.0))
++                            .on_hover_text("Post-VSR filter: 0% softer, 50% unchanged (default), 100% sharper. Applies only when the enhanced video is displayed.");
++                        ui.collapsing("Image adjustments", |ui| {
++                            let p = &mut draft.image_adjustments;
++                            ui.add(Slider::new(&mut p.brightness, -100.0..=100.0).text("Brightness").step_by(1.0));
++                            ui.add(Slider::new(&mut p.contrast, 0.0..=200.0).text("Contrast").suffix("%").step_by(1.0));
++                            ui.add(Slider::new(&mut p.saturation, 0.0..=200.0).text("Saturation").suffix("%").step_by(1.0));
++                            ui.add(Slider::new(&mut p.hue, -180.0..=180.0).text("Hue").suffix("°").step_by(1.0));
++                            ui.add(Slider::new(&mut p.gamma, 0.25..=3.0).text("Gamma").step_by(0.01));
++                            if ui.button("Reset image adjustments").clicked() {
++                                *p = ImageAdjustments::default();
++                            }
++                            ui.label(RichText::new("Live preview. Close Settings to save. Color controls work with VSR on or off.").small().color(COLOR_TEXT_SECONDARY));
++                        });
+ 
+                         if draft.fps_mode == FPS_MODE_CUSTOM {
+                             labeled_custom_fps(ui, draft);
+@@ -376,6 +399,7 @@
+ 
+                         separator(ui);
+                         if exit_button(ui).clicked() {
++                            output.apply_settings = Some(draft.clone());
+                             output.exit_requested = true;
+                         }
+ 
+--- a/tests/portable/Cargo.lock
++++ b/tests/portable/Cargo.lock
+@@ -3,12 +3,24 @@
+ version = 4
+ 
+ [[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
++[[package]]
+ name = "arrayvec"
+ version = "0.7.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+ 
+ [[package]]
++name = "autocfg"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
++
++[[package]]
+ name = "bit-set"
+ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -34,15 +46,27 @@
+ 
+ [[package]]
+ name = "bumpalo"
+-version = "3.20.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
++version = "3.20.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
++
++[[package]]
++name = "bytemuck"
++version = "1.25.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
++
++[[package]]
++name = "byteorder-lite"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
+ 
+ [[package]]
+ name = "cfg-if"
+-version = "1.0.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+ 
+ [[package]]
+ name = "cfg_aliases"
+@@ -61,10 +85,38 @@
+ ]
+ 
+ [[package]]
++name = "crc32fast"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
++dependencies = [
++ "cfg-if",
++]
++
++[[package]]
+ name = "equivalent"
+ version = "1.0.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
++
++[[package]]
++name = "fdeflate"
++version = "0.3.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
++dependencies = [
++ "simd-adler32",
++]
++
++[[package]]
++name = "flate2"
++version = "1.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
++dependencies = [
++ "crc32fast",
++ "miniz_oxide",
++]
+ 
+ [[package]]
+ name = "futures-core"
+@@ -109,6 +161,19 @@
+ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+ 
+ [[package]]
++name = "image"
++version = "0.25.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
++dependencies = [
++ "bytemuck",
++ "byteorder-lite",
++ "moxcms",
++ "num-traits",
++ "png",
++]
++
++[[package]]
+ name = "indexmap"
+ version = "2.14.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -146,6 +211,26 @@
+ version = "2.8.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++ "simd-adler32",
++]
++
++[[package]]
++name = "moxcms"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
++dependencies = [
++ "num-traits",
++ "pxfm",
++]
+ 
+ [[package]]
+ name = "naga"
+@@ -169,6 +254,15 @@
+ ]
+ 
+ [[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
+ name = "once_cell"
+ version = "1.21.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -181,6 +275,19 @@
+ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+ 
+ [[package]]
++name = "png"
++version = "0.18.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
++dependencies = [
++ "bitflags",
++ "crc32fast",
++ "fdeflate",
++ "flate2",
++ "miniz_oxide",
++]
++
++[[package]]
+ name = "proc-macro2"
+ version = "1.0.107"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -188,6 +295,12 @@
+ dependencies = [
+  "unicode-ident",
+ ]
++
++[[package]]
++name = "pxfm"
++version = "0.1.28"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5a041e753da8b807c9255f28de81879c78c876392ff2469cde94799b2896b9d"
+ 
+ [[package]]
+ name = "quote"
+@@ -254,6 +367,12 @@
+ ]
+ 
+ [[package]]
++name = "simd-adler32"
++version = "0.3.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
++
++[[package]]
+ name = "slab"
+ version = "0.4.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -307,6 +426,7 @@
+ name = "tacklecast-portable-checks"
+ version = "0.1.0"
+ dependencies = [
++ "image",
+  "naga",
+  "serde",
+  "serde_json",
+--- a/tests/portable/Cargo.toml
++++ b/tests/portable/Cargo.toml
+@@ -9,3 +9,4 @@
+ serde_json = "1"
+ naga = { version = "24", features = ["wgsl-in"] }
+ wgpu = { package = "wgpu-types", version = "=24.0.0" }
++image = { version = "=0.25.10", default-features = false, features = ["ico", "png"] }
+--- a/tests/portable/src/lib.rs
++++ b/tests/portable/src/lib.rs
+@@ -12,7 +12,13 @@
+                 let shader = fragment.split("\"#").next().unwrap();
+                 if !shader.contains("@vertex") { continue; }
+                 checked += 1;
+-                let module = naga::front::wgsl::parse_str(shader).unwrap();
++                let shader = format!("{}\n{}", include_str!("../../../src/render/image_adjustments.wgsl"), shader);
++                let module = naga::front::wgsl::parse_str(&shader).unwrap();
++                let (_, params) = module.types.iter().find(|(_, t)| t.name.as_deref() == Some("ImageParams")).unwrap();
++                if let naga::TypeInner::Struct { span, ref members } = params.inner {
++                    assert_eq!(span, 32);
++                    assert_eq!(members.iter().map(|m| m.offset).collect::<Vec<_>>(), vec![0, 4, 8, 12, 16, 20, 24, 28]);
++                } else { panic!("ImageParams must be a struct"); }
+                 naga::valid::Validator::new(naga::valid::ValidationFlags::all(),
+                     naga::valid::Capabilities::all()).validate(&module).unwrap();
+             }
+@@ -22,3 +28,12 @@
+ }
+ #[path = "../../../src/presentation.rs"] mod presentation;
+ #[path = "../../../src/frame_storage.rs"] mod frame_storage;
++
++#[test]
++fn executable_asset_decodes_for_owned_window_icon() {
++    let icon = image::load_from_memory_with_format(include_bytes!("../../../assets/icon.ico"),
++        image::ImageFormat::Ico).unwrap().into_rgba8();
++    assert!(icon.width() >= 32 && icon.height() >= 32);
++    assert_eq!(icon.as_raw().len(), (icon.width() * icon.height() * 4) as usize);
++    assert!(icon.pixels().any(|p| p.0[3] != 0));
++}
+--- /dev/null
++++ b/src/render/image_adjustments.wgsl
+@@ -0,0 +1,27 @@
++// Shared by direct video and the final VSR display. Not applied to VSR input.
++struct ImageParams {
++    brightness: f32, contrast: f32, saturation: f32, gamma: f32,
++    hue_cos: f32, hue_sin: f32, vsr_detail: f32, padding: f32,
++};
++fn adjust_color(input: vec3<f32>, p: ImageParams) -> vec3<f32> {
++    // Preserve the previous output exactly at neutral settings.
++    if p.brightness == 0.0 && p.contrast == 1.0 && p.saturation == 1.0 &&
++       p.gamma == 1.0 && p.hue_cos == 1.0 && p.hue_sin == 0.0 {
++        return input;
++    }
++    var rgb = input;
++    if p.saturation != 1.0 || p.hue_cos != 1.0 || p.hue_sin != 0.0 {
++        let y = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
++        let u = (rgb.b - y) / 1.8556;
++        let v = (rgb.r - y) / 1.5748;
++        let ru = (u * p.hue_cos - v * p.hue_sin) * p.saturation;
++        let rv = (u * p.hue_sin + v * p.hue_cos) * p.saturation;
++        let red = y + 1.5748 * rv;
++        let blue = y + 1.8556 * ru;
++        rgb = vec3<f32>(red, (y - 0.2126 * red - 0.0722 * blue) / 0.7152, blue);
++    }
++    rgb = clamp((rgb - vec3<f32>(0.5)) * p.contrast +
++                vec3<f32>(0.5 + p.brightness), vec3<f32>(0.0), vec3<f32>(1.0));
++    if p.gamma != 1.0 { rgb = pow(rgb, vec3<f32>(1.0 / p.gamma)); }
++    return rgb;
++}
+--- /dev/null
++++ b/docs/IMAGE-ADJUSTMENTS.md
+@@ -0,0 +1,26 @@
++# Image controls and window icon update
++
++Extract the entire Windows ZIP into a new folder and run TackleCast.exe. To keep your prior preferences, copy tacklecast_settings.json from the previous folder while TackleCast is closed. Existing settings files receive neutral defaults for the new controls.
++
++Press Escape to open Settings. In VIDEO, VSR sharpness is directly below Request Super Resolution. Expand Image adjustments for the color controls. Scroll the menu if needed. Adjustments preview live; Escape, clicking outside Settings, or exiting saves them. Reset image adjustments restores all six controls, including VSR sharpness.
++
++| Control | Range | Default |
++| --- | --- | --- |
++| VSR sharpness | 0–100% | 50% (previous appearance, unchanged) |
++| Brightness | -100 to +100 | 0 |
++| Contrast | 0–200% | 100% |
++| Saturation | 0–200% | 100% |
++| Hue | -180 to +180 degrees | 0 degrees |
++| Gamma | 0.25–3.00 | 1.00 |
++
++VSR sharpness is a post-processing filter on the enhanced image, not an NVIDIA driver sharpness parameter or a change to VSR model strength. Below 50% blends toward a small Gaussian blur; above 50% applies an unsharp mask. Start at 30–40% if edges look too crisp. At 50%, neighborhood filtering is bypassed. The control is available when Request Super Resolution is checked and affects only frames rendered through the VSR path. If VSR falls back to original video, the sharpness filter does not run. NVIDIA may still decline the VSR request; this control does not prove the driver activated VSR.
++
++Brightness, contrast, saturation, hue, and gamma work with VSR on or off, including original-frame fallback. They affect only video, not menus, the overlay, or letterboxing. Gamma values above 1 brighten midtones. All color controls run after VSR so they neither alter its input nor apply twice. Neutral settings bypass color adjustment and preserve the prior picture.
++
++The controls use the existing final fragment shader, with no extra render pass, frame queue, or CPU readback. Non-neutral controls add GPU work, especially sharpness; performance and end-to-end latency have not been measured on an RTX 3070 Ti. The prior fallback, freshest-frame selection, and all three presentation modes remain in this build.
++
++Both title-bar and taskbar icons are now set through winit using the same embedded assets/icon.ico used for the EXE resource. The runtime icon does not depend on a relative working directory or an external assets folder.
++
++Validation: Windows x64 release build succeeded; 20 portable tests passed, covering settings migration/persistence, invalid control values, both complete WGSL shaders and their uniform layout, icon decoding, and existing latency/VSR checks. No physical capture-card or NVIDIA runtime test was possible in the build environment.
++
++image-adjustments.patch records this update relative to the prior low-latency Mailbox source archive. Earlier patch files retain their original baselines.

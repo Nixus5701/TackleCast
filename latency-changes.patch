@@ -1,0 +1,1165 @@
+diff --git a/README.md b/README.md
+index d99612b..78610bc 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,5 @@
++This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
++
+ # TackleCast
+ 
+ > Experimental source fork: adds **Request Super Resolution (NVIDIA RTX)** to the Video settings. The option defaults to off. Windows compilation and NVIDIA hardware validation are still required; no tested executable is included. See [build, usage and validation notes](docs/RTX-SUPER-RESOLUTION.md).
+diff --git a/START-HERE.md b/START-HERE.md
+index 0b28e5d..1ef223f 100644
+--- a/START-HERE.md
++++ b/START-HERE.md
+@@ -1,3 +1,5 @@
++This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
++
+ # TackleCast with an experimental RTX Super Resolution option
+ 
+ This package contains modified source, **not a compiled Windows application**.
+diff --git a/docs/LATENCY-UPDATE.md b/docs/LATENCY-UPDATE.md
+new file mode 100644
+index 0000000..9a0ae19
+--- /dev/null
++++ b/docs/LATENCY-UPDATE.md
+@@ -0,0 +1,20 @@
++# Capture latency update
++
++Extract the full Windows ZIP into a new folder and run TackleCast.exe. Open Esc > Video and choose a Presentation mode, then use the menu's Apply action. The setting is saved across restarts.
++
++- Mailbox (default) preserves the previous mode preference and frame-latency limit of 2.
++- Immediate requests presentation with tearing permitted and a frame-latency limit of 1. If unsupported, the renderer uses Mailbox, then AutoVsync. Startup and mode-change logs show both requested and active modes.
++
++Both modes now choose the latest available capture frame after acquiring the display buffer. This prevents a frame chosen before a display wait from being unnecessarily stale when rendering starts. VSR processes the newly selected frame as before.
++
++Capture format negotiation now retains shared CUDA/DX12 handles through failed opening attempts. NV12-to-MJPEG fallback can use shared GPU storage when the actual capture dimensions match. Resolution fallback with incompatible storage uses the owned decode path. The shared decoder validates JPEG dimensions against its actual allocation, replacing the old hardcoded size assumption.
++
++Shared capture storage is retained until both CPU frame readers and the GPU upload copy finish. Four reusable storage slots accommodate ownership without making a four-frame FIFO. When no slot is available, the decoder skips that packet rather than overwriting an in-use buffer or adding a CPU wait. The existing CUDA completion wait remains necessary.
++
++## Validation
++
++Windows x64 release compilation passed. Seventeen portable tests passed, including settings persistence/defaults, presentation-mode fallback, GPU storage ownership, existing triple-buffer newest-frame behavior, VSR geometry, and WGSL shader validation. The Windows unit-test executable also builds, but cannot be executed in this environment. No physical capture-card, NVIDIA runtime, tearing, or end-to-end latency measurements were performed. Improvements are implementation changes, not a measured latency guarantee.
++
++For an A/B comparison, keep capture format/resolution/FPS, window size, monitor refresh and VSR settings identical. Compare Mailbox and Immediate. The log entry `gpu_decode=true, zero_copy=true` identifies active shared capture storage; `presentation requested=... active=... maximum_frame_latency=...` identifies the actual display mode.
++
++This build is based on the source ZIP supplied for the latency audit. The latency-changes.patch file contains changes against that supplied baseline; changes.patch retains the prior VSR changes against upstream. See BUILD.md for the Windows toolchain and scripts/build_rtx.ps1 for packaging. Portable checks run with `cargo test --manifest-path tests/portable/Cargo.toml`.
+diff --git a/scripts/build_rtx.ps1 b/scripts/build_rtx.ps1
+index 5b059f1..525b76c 100644
+--- a/scripts/build_rtx.ps1
++++ b/scripts/build_rtx.ps1
+@@ -64,6 +64,7 @@ try {
+     Copy-Item 'assets\*' $assetDestination -Recurse -Force
+     Copy-Item 'LICENSE' $destination -Force
+     Copy-Item 'docs\RTX-SUPER-RESOLUTION.md' $destination -Force
++    Copy-Item 'docs\LATENCY-UPDATE.md' $destination -Force
+     Write-Host "Build complete: $destination\TackleCast.exe"
+     Write-Host 'For GPU MJPEG decoding, include nvjpeg64_13.dll and cudart64_13.dll from the original TackleCast package or CUDA installation.'
+     Write-Host 'Enable NVIDIA RTX Video Super Resolution, then Esc > Video > Request Super Resolution in TackleCast.'
+diff --git a/src/capture.rs b/src/capture.rs
+index 0e3c6cc..6a87798 100644
+--- a/src/capture.rs
++++ b/src/capture.rs
+@@ -47,6 +47,8 @@ pub enum CaptureFrame {
+         width: u32,
+         height: u32,
+         buffer_index: usize,
++        // Retained through GPU copy completion before CUDA may reuse this set.
++        lease: Arc<()>,
+     },
+ }
+ 
+@@ -384,7 +386,7 @@ fn run_directshow_capture(
+                 stats_tx.clone(),
+                 event_proxy,
+                 #[cfg(feature = "gpu-decode")]
+-                shared_gpu_handles.take(),
++                &mut shared_gpu_handles,
+             ) {
+                 Ok(()) => {
+                     // Notify if we fell back to different settings
+@@ -430,7 +432,7 @@ fn run_directshow_capture_inner(
+     stats_tx: Sender<CaptureStats>,
+     event_proxy: &EventLoopProxy<AppEvent>,
+     #[cfg(feature = "gpu-decode")]
+-    shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
++    shared_gpu_handles: &mut Option<crate::dx12_interop::ImportHandles>,
+ ) -> Result<(), String> {
+     let dshow_format = find_dshow_format()
+         .ok_or_else(|| "DirectShow input format was not found in FFmpeg".to_string())?;
+@@ -516,7 +518,11 @@ fn run_directshow_capture_inner(
+     #[cfg(feature = "gpu-decode")]
+     let mut gpu_decoder = if requested_pixel_format.is_some_and(|f| f.eq_ignore_ascii_case("mjpeg")) {
+         // Try zero-copy shared buffer mode first, then fall back to owned mode
+-        if let Some(handles) = shared_gpu_handles {
++        let shared_compatible = shared_gpu_handles.as_ref().is_some_and(|handles| {
++            handles.layout.width == actual_width && handles.layout.height == actual_height
++        });
++        if shared_compatible {
++            let handles = shared_gpu_handles.take().expect("compatible shared handles");
+             info!("attempting zero-copy GPU decode with shared DX12 buffers");
+             crate::gpu_decode::NvjpegDecoder::try_new_shared(handles)
+                 .or_else(|| {
+@@ -633,6 +639,7 @@ fn run_directshow_capture_inner(
+                         }
+                         continue; // skip software decode
+                     }
++                    Err(crate::gpu_decode::GpuDecodeError::Busy) => continue,
+                     Err(crate::gpu_decode::GpuDecodeError::InvalidData(_)) => {
+                         // Bad packet (e.g. config header) — skip to software decode
+                         // for this packet, keep GPU decode active for the next one.
+diff --git a/src/dx12_interop.rs b/src/dx12_interop.rs
+index 2a98bbf..acddbdd 100644
+--- a/src/dx12_interop.rs
++++ b/src/dx12_interop.rs
+@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Direct3D12::*;
+ use windows::core::PCWSTR;
+ 
+ /// Number of double-buffer sets.
+-pub const NUM_BUFFER_SETS: usize = 2;
++pub const NUM_BUFFER_SETS: usize = 4;
+ 
+ // ---------------------------------------------------------------------------
+ // Long-lived types (stored in Renderer for the duration of capture)
+@@ -43,6 +43,8 @@ pub struct PlaneBufferSet {
+ /// buffers. Lives as long as the decode session. Contains no kernel resources.
+ #[derive(Debug, Clone, Copy)]
+ pub struct SharedBufferLayout {
++    pub width: u32,
++    pub height: u32,
+     /// Row pitch for Y plane (aligned to COPY_BYTES_PER_ROW_ALIGNMENT).
+     pub y_pitch: u32,
+     /// Row pitch for U/V planes (aligned).
+@@ -122,7 +124,7 @@ fn plane_sizes(width: u32, height: u32) -> SharedBufferLayout {
+     let uv_pitch = ((width / 2) + align - 1) & !(align - 1);
+     let y_size = (y_pitch as u64) * (height as u64);
+     let uv_size = (uv_pitch as u64) * (height as u64);
+-    SharedBufferLayout { y_pitch, uv_pitch, y_size, uv_size }
++    SharedBufferLayout { width, height, y_pitch, uv_pitch, y_size, uv_size }
+ }
+ 
+ impl SharedGpuBuffers {
+diff --git a/src/frame_storage.rs b/src/frame_storage.rs
+new file mode 100644
+index 0000000..6a956ab
+--- /dev/null
++++ b/src/frame_storage.rs
+@@ -0,0 +1,26 @@
++use std::sync::Arc;
++
++// Only the decode thread claims free slots. Other threads can only clone a
++// lease they already own, so a count of one cannot acquire a concurrent reader.
++pub fn free_slot(leases: &[Arc<()>]) -> Option<usize> {
++    leases.iter().position(|lease| Arc::strong_count(lease) == 1)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn storage_is_held_until_both_frame_and_gpu_readers_finish() {
++        let slots = vec![Arc::new(()), Arc::new(())];
++        let frame = slots[0].clone();
++        let gpu_copy = frame.clone();
++        let other_frame = slots[1].clone();
++        assert_eq!(free_slot(&slots), None);
++        drop(frame);
++        assert_eq!(free_slot(&slots), None);
++        drop(gpu_copy);
++        assert_eq!(free_slot(&slots), Some(0));
++        drop(other_frame);
++        assert_eq!(free_slot(&slots), Some(0));
++    }
++}
+diff --git a/src/gpu_decode.rs b/src/gpu_decode.rs
+index 7039aa2..284ad16 100644
+--- a/src/gpu_decode.rs
++++ b/src/gpu_decode.rs
+@@ -9,6 +9,7 @@ use crate::capture::{CaptureFrame, PixelFormat};
+ use std::borrow::Cow;
+ use std::ffi::c_void;
+ use std::ptr;
++use std::sync::Arc;
+ use tracing::{debug, info, trace, warn};
+ 
+ // ---------------------------------------------------------------------------
+@@ -421,6 +422,7 @@ impl NvjpegLib {
+ 
+ #[derive(Debug)]
+ pub enum GpuDecodeError {
++    Busy,
+     Cuda(&'static str, CUresult),
+     Nvjpeg(&'static str, NvjpegStatus),
+     InvalidData(String),
+@@ -429,6 +431,7 @@ pub enum GpuDecodeError {
+ impl std::fmt::Display for GpuDecodeError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
++            Self::Busy => f.write_str("shared GPU buffers are still in use"),
+             Self::Cuda(op, code) => write!(f, "CUDA {op} failed (error {code})"),
+             Self::Nvjpeg(op, code) => write!(f, "nvJPEG {op} failed (error {code})"),
+             Self::InvalidData(msg) => write!(f, "invalid JPEG data: {msg}"),
+@@ -480,6 +483,7 @@ enum DecodeMode {
+     Shared {
+         sets: Vec<SharedPlaneSet>,
+         current_index: usize,
++        leases: Vec<Arc<()>>,
+     },
+ }
+ 
+@@ -833,8 +837,8 @@ impl NvjpegDecoder {
+             // ImportHandleSet::drop(). Successfully imported ones were nulled
+             // so Drop is a no-op for them.
+ 
+-            let alloc_width = 2560_u32; // will be validated on first frame
+-            let alloc_height = 1440_u32;
++            let alloc_width = import_handles.layout.width;
++            let alloc_height = import_handles.layout.height;
+ 
+             info!(
+                 "nvJPEG GPU decoder initialized in zero-copy mode ({} buffer sets, Y={}B UV={}B)",
+@@ -851,6 +855,7 @@ impl NvjpegDecoder {
+                 handle: nvjpeg_handle,
+                 state: nvjpeg_state,
+                 mode: DecodeMode::Shared {
++                    leases: (0..sets.len()).map(|_| Arc::new(())).collect(),
+                     sets,
+                     current_index: 0,
+                 },
+@@ -891,7 +896,6 @@ impl NvjpegDecoder {
+                 "nvJPEG first frame: {}x{}, subsampling={:?}, components={}",
+                 info.0, info.1, info.2, info.3
+             );
+-            self.validated = true;
+             (info.0, info.1)
+         } else {
+             (self.alloc_width, self.alloc_height)
+@@ -899,6 +903,15 @@ impl NvjpegDecoder {
+ 
+         // Reallocate if dimensions changed (owned mode only)
+         self.ensure_buffers(width, height)?;
++        // Keep retrying validation if allocation dimensions were incompatible.
++        self.validated = true;
++
++        // Release the producer's old slot, then claim storage with no CPU/GPU readers.
++        if let DecodeMode::Shared { leases, current_index, .. } = &mut self.mode {
++            *out = CaptureFrame::empty();
++            *current_index = crate::frame_storage::free_slot(leases)
++                .ok_or(GpuDecodeError::Busy)?;
++        }
+ 
+         // Get the device pointers and row pitches for the current decode target.
+         // In shared mode, pitches are aligned to wgpu's COPY_BYTES_PER_ROW_ALIGNMENT
+@@ -907,7 +920,7 @@ impl NvjpegDecoder {
+             DecodeMode::Owned { d_y, d_u, d_v, .. } => {
+                 (d_y.ptr, d_u.ptr, d_v.ptr, width as usize, (width / 2) as usize)
+             }
+-            DecodeMode::Shared { sets, current_index } => {
++            DecodeMode::Shared { sets, current_index, .. } => {
+                 let set = &sets[*current_index];
+                 (
+                     set.y.device_ptr,
+@@ -952,15 +965,16 @@ impl NvjpegDecoder {
+         }
+ 
+         match &mut self.mode {
+-            DecodeMode::Shared { current_index, sets } => {
++            DecodeMode::Shared { current_index, leases, .. } => {
+                 // Zero-copy: the data is already in the shared DX12 buffer, so
+                 // the frame just names the set and advances the index.
+                 let buffer_index = *current_index;
+-                *current_index = (*current_index + 1) % sets.len();
++                let lease = leases[buffer_index].clone();
+                 *out = CaptureFrame::Gpu {
+                     width,
+                     height,
+                     buffer_index,
++                    lease,
+                 };
+                 Ok(())
+             }
+@@ -1073,12 +1087,8 @@ impl NvjpegDecoder {
+ 
+         match &mut self.mode {
+             DecodeMode::Shared { .. } => {
+-                // Shared buffers are pre-allocated at a fixed size.
+-                // If the actual frame dimensions differ, update tracking but
+-                // don't reallocate — the buffers are large enough for up to 2560x1440.
+-                self.alloc_width = width;
+-                self.alloc_height = height;
+-                Ok(())
++                // Renderer and CUDA must agree on the allocation's row pitch and size.
++                Err(GpuDecodeError::Cuda("shared capture dimensions changed", -1))
+             }
+             DecodeMode::Owned {
+                 d_y,
+diff --git a/src/main.rs b/src/main.rs
+index 369847a..a8b9881 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,6 +11,9 @@ mod gpu_decode;
+ mod gpu_monitor;
+ mod logger;
+ mod render;
++mod presentation;
++#[cfg(feature = "gpu-decode")]
++mod frame_storage;
+ mod rtx_vsr;
+ mod settings;
+ mod triple_buffer;
+@@ -316,6 +319,7 @@ impl ApplicationHandler<AppEvent> for App {
+             window.clone(),
+             self.settings.scaling_filter,
+             self.settings.request_super_resolution,
++            self.settings.presentation_mode,
+         )) {
+             Ok(renderer) => renderer,
+             Err(error) => {
+@@ -443,8 +447,14 @@ impl ApplicationHandler<AppEvent> for App {
+                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
+                     let exit_requested = prepared_ui.output.exit_requested;
+                     let apply_settings = prepared_ui.output.apply_settings.clone();
+-                    if let Err(error) = renderer.render(Some(prepared_ui)) {
+-                        error!("render error: {error}");
++                    match renderer.render(Some(prepared_ui), self.capture.as_mut()) {
++                        Ok(true) => {
++                            self.latest_error = None;
++                            self.render_frames_uploaded += 1;
++                            self.last_frame_at = Some(Instant::now());
++                        }
++                        Ok(false) => {}
++                        Err(error) => error!("render error: {error}"),
+                     }
+                     self.render_frame_counter += 1;
+                     if toggle_fullscreen {
+@@ -483,20 +493,7 @@ impl ApplicationHandler<AppEvent> for App {
+                     return;
+                 }
+ 
+-                let mut uploaded = false;
+-                if let (Some(capture), Some(renderer)) = (&mut self.capture, &mut self.renderer) {
+-                    if let Some(frame) = capture.latest_frame() {
+-                        renderer.upload_frame(frame);
+-                        uploaded = true;
+-                    }
+-                }
+-                if uploaded {
+-                    self.latest_error = None;
+-                    self.render_frames_uploaded += 1;
+-                    self.last_frame_at = Some(Instant::now());
+-                    self.update_sleep_suppression();
+-                }
+-
++                // Coalesced redraws choose their capture frame after the display wait.
+                 if let Some(window) = &self.window {
+                     window.request_redraw();
+                 }
+@@ -512,6 +509,8 @@ impl ApplicationHandler<AppEvent> for App {
+         // overlay frozen on stale numbers.
+         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HOUSEKEEPING_TICK));
+ 
++        if let Some(renderer) = &self.renderer { renderer.poll_gpu(); }
++
+         // Poll non-frame channels (stats, errors, negotiation).
+         // These are low-frequency and don't need event-driven wakeup.
+         if let Some(capture) = &mut self.capture {
+@@ -619,6 +618,12 @@ impl App {
+             }
+         }
+ 
++        if old_settings.presentation_mode != self.settings.presentation_mode {
++            if let Some(renderer) = &mut self.renderer {
++                renderer.set_presentation_mode(self.settings.presentation_mode);
++            }
++        }
++
+         if scaling_changed {
+             if let Some(renderer) = &mut self.renderer {
+                 renderer.set_scale_filter(self.settings.scaling_filter);
+diff --git a/src/presentation.rs b/src/presentation.rs
+new file mode 100644
+index 0000000..b3ee02f
+--- /dev/null
++++ b/src/presentation.rs
+@@ -0,0 +1,36 @@
++use crate::settings::PresentationMode;
++use wgpu::PresentMode;
++
++pub fn choose_present_mode(requested: PresentationMode, available: &[PresentMode]) -> PresentMode {
++    let order = match requested {
++        PresentationMode::Mailbox => [PresentMode::Mailbox, PresentMode::Immediate],
++        PresentationMode::Immediate => [PresentMode::Immediate, PresentMode::Mailbox],
++    };
++    order.into_iter().find(|mode| available.contains(mode)).unwrap_or(PresentMode::AutoVsync)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn modes_and_unsupported_fallbacks() {
++        let modes = [PresentMode::Fifo, PresentMode::Mailbox, PresentMode::Immediate];
++        assert_eq!(choose_present_mode(PresentationMode::Mailbox, &modes), PresentMode::Mailbox);
++        assert_eq!(choose_present_mode(PresentationMode::Immediate, &modes), PresentMode::Immediate);
++        assert_eq!(choose_present_mode(PresentationMode::Immediate, &[PresentMode::Mailbox]), PresentMode::Mailbox);
++        assert_eq!(choose_present_mode(PresentationMode::Mailbox, &[PresentMode::Immediate]), PresentMode::Immediate);
++        assert_eq!(choose_present_mode(PresentationMode::Immediate, &[PresentMode::Fifo]), PresentMode::AutoVsync);
++        assert_eq!(PresentationMode::Immediate.frame_latency(), 1);
++        assert_eq!(PresentationMode::Mailbox.frame_latency(), 2);
++    }
++    #[test]
++    fn old_settings_and_saved_selection() {
++        let old: crate::settings::Settings = serde_json::from_str("{}").unwrap();
++        assert_eq!(old.presentation_mode, PresentationMode::Mailbox);
++        let mut updated = old;
++        updated.presentation_mode = PresentationMode::Immediate;
++        let saved = serde_json::to_string(&updated).unwrap();
++        let restored: crate::settings::Settings = serde_json::from_str(&saved).unwrap();
++        assert_eq!(restored, updated);
++    }
++}
+diff --git a/src/render.rs b/src/render.rs
+index c764c81..b1193d0 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1,7 +1,8 @@
+ #![allow(clippy::items_after_test_module)]
+ 
+-use crate::capture::{CaptureFrame, PixelFormat};
+-use crate::settings::ScaleFilter;
++use crate::capture::{CaptureFrame, CaptureThread, PixelFormat};
++use crate::settings::{ScaleFilter, PresentationMode};
++use crate::presentation::choose_present_mode;
+ use crate::ui::PreparedUi;
+ use bytemuck::{Pod, Zeroable};
+ use egui_wgpu::Renderer as EguiRenderer;
+@@ -23,6 +24,7 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+ };
+ 
+ pub struct Renderer {
++    presentation_modes: Vec<PresentMode>,
+     request_super_resolution: bool,
+     super_resolution_status: String,
+     vsr_failed: bool,
+@@ -59,6 +61,7 @@ impl Renderer {
+         window: Arc<Window>,
+         scale_filter: ScaleFilter,
+         request_super_resolution: bool,
++        presentation_mode: PresentationMode,
+     ) -> Result<Self, RenderError> {
+         let size = window.inner_size();
+         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
+@@ -108,18 +111,7 @@ impl Renderer {
+             format: surface_format,
+             width: size.width.max(1),
+             height: size.height.max(1),
+-            present_mode: caps
+-                .present_modes
+-                .iter()
+-                .copied()
+-                .find(|mode| *mode == PresentMode::Mailbox)
+-                .or_else(|| {
+-                    caps.present_modes
+-                        .iter()
+-                        .copied()
+-                        .find(|mode| *mode == PresentMode::Immediate)
+-                })
+-                .unwrap_or(PresentMode::AutoVsync),
++            present_mode: choose_present_mode(presentation_mode, &caps.present_modes),
+             alpha_mode: caps
+                 .alpha_modes
+                 .iter()
+@@ -127,10 +119,10 @@ impl Renderer {
+                 .find(|mode| *mode == CompositeAlphaMode::Opaque)
+                 .unwrap_or(CompositeAlphaMode::Auto),
+             view_formats: vec![],
+-            desired_maximum_frame_latency: 2,
++            desired_maximum_frame_latency: presentation_mode.frame_latency(),
+         };
+ 
+-        info!("present mode: {:?}", config.present_mode);
++        info!("presentation requested={:?} active={:?} maximum_frame_latency={}", presentation_mode, config.present_mode, config.desired_maximum_frame_latency);
+         surface.configure(&device, &config);
+ 
+         let video_bind_group_layout =
+@@ -233,6 +225,7 @@ impl Renderer {
+         let egui_renderer = EguiRenderer::new(&device, surface_format, None, 1, false);
+ 
+         Ok(Self {
++            presentation_modes: caps.present_modes.clone(),
+             request_super_resolution,
+             super_resolution_status: if request_super_resolution { "Waiting for video" } else { "Off" }.to_owned(),
+             vsr_failed: false,
+@@ -357,6 +350,20 @@ impl Renderer {
+         }
+     }
+ 
++    pub fn set_presentation_mode(&mut self, mode: PresentationMode) {
++        self.config.present_mode = choose_present_mode(mode, &self.presentation_modes);
++        self.config.desired_maximum_frame_latency = mode.frame_latency();
++        info!("presentation requested={:?} active={:?} maximum_frame_latency={}", mode,
++              self.config.present_mode, self.config.desired_maximum_frame_latency);
++        if self.size.width > 0 && self.size.height > 0 {
++            self.surface.configure(&self.device, &self.config);
++        }
++    }
++
++    pub fn poll_gpu(&self) {
++        self.device.poll(wgpu::Maintain::Poll);
++    }
++
+     pub fn upload_frame(&mut self, frame: &CaptureFrame) {
+         self.frame_serial = self.frame_serial.wrapping_add(1);
+         match frame {
+@@ -373,7 +380,8 @@ impl Renderer {
+                 width,
+                 height,
+                 buffer_index,
+-            } => self.upload_gpu_frame(*width, *height, *buffer_index),
++                lease,
++            } => self.upload_gpu_frame(*width, *height, *buffer_index, lease.clone()),
+         }
+     }
+ 
+@@ -490,7 +498,7 @@ impl Renderer {
+     }
+ 
+     #[cfg(feature = "gpu-decode")]
+-    fn upload_gpu_frame(&mut self, width: u32, height: u32, buffer_index: usize) {
++    fn upload_gpu_frame(&mut self, width: u32, height: u32, buffer_index: usize, lease: Arc<()>) {
+         let Some(shared) = &self.shared_gpu_buffers else {
+             tracing::warn!("GPU frame received but no shared buffers initialized");
+             return;
+@@ -614,11 +622,12 @@ impl Renderer {
+         );
+ 
+         self.queue.submit(std::iter::once(encoder.finish()));
++        self.queue.on_submitted_work_done(move || drop(lease));
+     }
+ 
+-    pub fn render(&mut self, ui: Option<PreparedUi>) -> Result<(), RenderError> {
++    pub fn render(&mut self, ui: Option<PreparedUi>, capture: Option<&mut CaptureThread>) -> Result<bool, RenderError> {
+         if self.size.width == 0 || self.size.height == 0 {
+-            return Ok(());
++            return Ok(false);
+         }
+ 
+         let frame = match self.surface.get_current_texture() {
+@@ -628,16 +637,23 @@ impl Renderer {
+                 // Flush any staged write_texture/write_buffer calls so they
+                 // don't accumulate when we can't present.
+                 self.queue.submit(std::iter::empty());
+-                return Ok(());
++                return Ok(false);
+             }
+             Err(wgpu::SurfaceError::Timeout) => {
+                 self.queue.submit(std::iter::empty());
+-                return Ok(());
++                return Ok(false);
+             }
+             Err(wgpu::SurfaceError::OutOfMemory) => return Err(RenderError::OutOfMemory),
+             Err(error) => return Err(RenderError::Surface(error)),
+         };
+ 
++        self.poll_gpu();
++        // Surface acquisition may block. Read the newest capture only after it finishes.
++        let uploaded = if let Some(latest) = capture.and_then(|capture| capture.latest_frame()) {
++            self.upload_frame(latest);
++            true
++        } else { false };
++
+         let view = frame
+             .texture
+             .create_view(&wgpu::TextureViewDescriptor::default());
+@@ -768,7 +784,7 @@ impl Renderer {
+ 
+         self.window.pre_present_notify();
+         frame.present();
+-        Ok(())
++        Ok(uploaded)
+     }
+ }
+ 
+diff --git a/src/settings.rs b/src/settings.rs
+index 30606a7..e856543 100644
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -14,6 +14,8 @@ pub const MAX_FPS: u32 = 240;
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct Settings {
++    #[serde(default)]
++    pub presentation_mode: PresentationMode,
+     #[serde(default)]
+     pub video_device: String,
+     #[serde(default = "default_scaling_filter")]
+@@ -84,9 +86,30 @@ impl Display for ScaleFilter {
+     }
+ }
+ 
++#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "lowercase")]
++pub enum PresentationMode {
++    #[default]
++    Mailbox,
++    Immediate,
++}
++impl PresentationMode {
++    pub const ALL: [Self; 2] = [Self::Mailbox, Self::Immediate];
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::Mailbox => "Mailbox (default)",
++            Self::Immediate => "Immediate (lowest latency; may tear)",
++        }
++    }
++    pub fn frame_latency(self) -> u32 {
++        match self { Self::Mailbox => 2, Self::Immediate => 1 }
++    }
++}
++
+ impl Default for Settings {
+     fn default() -> Self {
+         Self {
++            presentation_mode: PresentationMode::default(),
+             video_device: String::new(),
+             scaling_filter: default_scaling_filter(),
+             request_super_resolution: false,
+diff --git a/src/ui.rs b/src/ui.rs
+index 4354ea0..559af87 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -1,5 +1,5 @@
+ use crate::devices::AudioDevice;
+-use crate::settings::{Settings, ScaleFilter, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
++use crate::settings::{Settings, ScaleFilter, PresentationMode, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
+ use egui::{
+     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
+     Margin, RichText, Slider, Stroke,
+@@ -304,6 +304,16 @@ fn draw_menu(
+                             fps_mode_combo(&mut columns[1], &mut draft.fps_mode);
+                         });
+ 
++                        ui.label("Presentation mode");
++                        ComboBox::from_id_salt("presentation_mode")
++                            .selected_text(draft.presentation_mode.label())
++                            .show_ui(ui, |ui| {
++                                for mode in PresentationMode::ALL {
++                                    ui.selectable_value(&mut draft.presentation_mode, mode, mode.label());
++                                }
++                            });
++                        ui.label(RichText::new("Immediate allows tearing and limits queued frames to one. Unsupported modes fall back automatically.").small().color(COLOR_TEXT_SECONDARY));
++
+                         scaling_filter_combo(
+                             ui,
+                             "Scaling Filter",
+diff --git a/tests/portable/Cargo.lock b/tests/portable/Cargo.lock
+new file mode 100644
+index 0000000..3e2e6cf
+--- /dev/null
++++ b/tests/portable/Cargo.lock
+@@ -0,0 +1,458 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "arrayvec"
++version = "0.7.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
++
++[[package]]
++name = "bit-set"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
++dependencies = [
++ "bit-vec",
++]
++
++[[package]]
++name = "bit-vec"
++version = "0.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
++
++[[package]]
++name = "bitflags"
++version = "2.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "bumpalo"
++version = "3.20.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "cfg_aliases"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
++
++[[package]]
++name = "codespan-reporting"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3538270d33cc669650c4b093848450d380def10c331d38c768e34cac80576e6e"
++dependencies = [
++ "termcolor",
++ "unicode-width",
++]
++
++[[package]]
++name = "equivalent"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
++
++[[package]]
++name = "futures-core"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
++
++[[package]]
++name = "futures-task"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
++
++[[package]]
++name = "futures-util"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
++dependencies = [
++ "futures-core",
++ "futures-task",
++ "pin-project-lite",
++ "slab",
++]
++
++[[package]]
++name = "hashbrown"
++version = "0.17.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
++
++[[package]]
++name = "heck"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
++
++[[package]]
++name = "hexf-parse"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
++
++[[package]]
++name = "indexmap"
++version = "2.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
++dependencies = [
++ "equivalent",
++ "hashbrown",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "js-sys"
++version = "0.3.106"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7883d941dae510fb2d978fc3fe018c71c9e2892fd38854de3e8b92c2e5ad9cc5"
++dependencies = [
++ "cfg-if",
++ "futures-util",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "log"
++version = "0.4.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "naga"
++version = "24.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e380993072e52eef724eddfcde0ed013b0c023c3f0417336ed041aa9f076994e"
++dependencies = [
++ "arrayvec",
++ "bit-set",
++ "bitflags",
++ "cfg_aliases",
++ "codespan-reporting",
++ "hexf-parse",
++ "indexmap",
++ "log",
++ "rustc-hash",
++ "strum",
++ "termcolor",
++ "thiserror",
++ "unicode-xid",
++]
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "pin-project-lite"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "rustc-hash"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
++
++[[package]]
++name = "rustversion"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.151"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "slab"
++version = "0.4.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
++
++[[package]]
++name = "strum"
++version = "0.26.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
++dependencies = [
++ "strum_macros",
++]
++
++[[package]]
++name = "strum_macros"
++version = "0.26.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
++dependencies = [
++ "heck",
++ "proc-macro2",
++ "quote",
++ "rustversion",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "tacklecast-portable-checks"
++version = "0.1.0"
++dependencies = [
++ "naga",
++ "serde",
++ "serde_json",
++ "wgpu-types",
++]
++
++[[package]]
++name = "termcolor"
++version = "1.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
++dependencies = [
++ "winapi-util",
++]
++
++[[package]]
++name = "thiserror"
++version = "2.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
++dependencies = [
++ "thiserror-impl",
++]
++
++[[package]]
++name = "thiserror-impl"
++version = "2.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.26"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
++
++[[package]]
++name = "unicode-width"
++version = "0.1.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
++
++[[package]]
++name = "unicode-xid"
++version = "0.2.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
++
++[[package]]
++name = "wasm-bindgen"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9bb54f33acc68fd454578d9820b0bde1a1a3d17aa17bb7b6595806d02886d409"
++dependencies = [
++ "cfg-if",
++ "once_cell",
++ "rustversion",
++ "wasm-bindgen-macro",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-macro"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2e29d0c35b16e224a7eeb5cd2d25e3e1968fbd65604117b44d3b789d00ee8535"
++dependencies = [
++ "quote",
++ "wasm-bindgen-macro-support",
++]
++
++[[package]]
++name = "wasm-bindgen-macro-support"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6f501a8bc3719dba86ef8ae4728879c08001bea749eb1333ac5b91e040e2a6b7"
++dependencies = [
++ "bumpalo",
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-shared"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "web-sys"
++version = "0.3.106"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
++dependencies = [
++ "js-sys",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "wgpu-types"
++version = "24.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "50ac044c0e76c03a0378e7786ac505d010a873665e2d51383dcff8dd227dc69c"
++dependencies = [
++ "bitflags",
++ "js-sys",
++ "log",
++ "web-sys",
++]
++
++[[package]]
++name = "winapi-util"
++version = "0.1.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
++dependencies = [
++ "windows-sys",
++]
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/tests/portable/Cargo.toml b/tests/portable/Cargo.toml
+new file mode 100644
+index 0000000..99252ab
+--- /dev/null
++++ b/tests/portable/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "tacklecast-portable-checks"
++version = "0.1.0"
++edition = "2021"
++publish = false
++
++[dependencies]
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++naga = { version = "24", features = ["wgsl-in"] }
++wgpu = { package = "wgpu-types", version = "=24.0.0" }
+diff --git a/tests/portable/src/lib.rs b/tests/portable/src/lib.rs
+new file mode 100644
+index 0000000..daba39c
+--- /dev/null
++++ b/tests/portable/src/lib.rs
+@@ -0,0 +1,24 @@
++#[path = "../../../src/rtx_vsr.rs"] mod rtx_vsr;
++#[path = "../../../src/settings.rs"] mod settings;
++#[path = "../../../src/triple_buffer.rs"] mod triple_buffer;
++
++#[cfg(test)]
++mod shader_tests {
++    #[test]
++    fn rendering_shaders_parse_and_validate() {
++        let mut checked = 0;
++        for source in [include_str!("../../../src/render.rs"), include_str!("../../../src/render/vsr.rs")] {
++            for fragment in source.split("r#\"").skip(1) {
++                let shader = fragment.split("\"#").next().unwrap();
++                if !shader.contains("@vertex") { continue; }
++                checked += 1;
++                let module = naga::front::wgsl::parse_str(shader).unwrap();
++                naga::valid::Validator::new(naga::valid::ValidationFlags::all(),
++                    naga::valid::Capabilities::all()).validate(&module).unwrap();
++            }
++        }
++        assert_eq!(checked, 2);
++    }
++}
++#[path = "../../../src/presentation.rs"] mod presentation;
++#[path = "../../../src/frame_storage.rs"] mod frame_storage;

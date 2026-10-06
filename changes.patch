@@ -1,0 +1,1320 @@
+diff --git a/BUILD.md b/BUILD.md
+index 1d85a7d..40282e7 100644
+--- a/BUILD.md
++++ b/BUILD.md
+@@ -32,6 +32,9 @@ The release executable is at `target\release\tacklecast.exe`.
+ | Flag | Default | Description |
+ |---|---|---|
+ | `gpu-decode` | on | NVIDIA nvJPEG GPU decode + zero-copy pipeline |
++| `rtx-vsr` | on | Optional NVIDIA D3D11 VideoProcessor request through a GPU-only bridge; runtime setting defaults off |
++
++For this experimental fork, `Build-RTX.cmd -FFmpegDir C:\ffmpeg -RunTests` builds a separate package. See [RTX Super Resolution](docs/RTX-SUPER-RESOLUTION.md) for its validation status and usage.
+ 
+ To build without GPU decode support:
+ 
+@@ -75,4 +78,3 @@ These can be copied from your CUDA Toolkit installation (`C:\Program Files\NVIDI
+ - Settings are loaded from `tacklecast_settings.json` next to the exe
+ - Logs are written to `logs\` next to the exe
+ - The app forces the wgpu DX12 backend on Windows (required for zero-copy CUDA interop)
+-
+diff --git a/Build-RTX.cmd b/Build-RTX.cmd
+new file mode 100644
+index 0000000..c558127
+--- /dev/null
++++ b/Build-RTX.cmd
+@@ -0,0 +1,10 @@
++@echo off
++cd /d "%~dp0"
++powershell.exe -NoProfile -File "%~dp0scripts\build_rtx.ps1" %*
++if errorlevel 1 (
++  echo.
++  echo Build failed. Read the message above for the missing prerequisite or error.
++  pause
++  exit /b 1
++)
++pause
+diff --git a/Cargo.lock b/Cargo.lock
+index 7b8ad36..627fa4d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3028,6 +3028,7 @@ name = "tacklecast"
+ version = "2.1.0"
+ dependencies = [
+  "bytemuck",
++ "cc",
+  "cpal",
+  "crossbeam-channel",
+  "egui",
+@@ -4379,4 +4380,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+ dependencies = [
+  "zune-core",
+ ]
+-
+diff --git a/Cargo.toml b/Cargo.toml
+index 357ab05..fcb8427 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4,6 +4,7 @@ version = "2.1.0"
+ edition = "2021"
+ 
+ [build-dependencies]
++cc = "1.2"
+ winresource = "0.1.31"
+ 
+ [dependencies]
+@@ -45,10 +46,10 @@ windows = { version = "0.58", features = [
+ libloading = { version = "0.8", optional = true }
+ 
+ [features]
+-default = ["gpu-decode"]
++default = ["gpu-decode", "rtx-vsr"]
+ gpu-decode = ["dep:libloading"]
++rtx-vsr = []
+ 
+ [profile.release]
+ opt-level = 3
+ lto = "thin"
+-
+diff --git a/README.md b/README.md
+index 9355b13..d99612b 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # TackleCast
+ 
++> Experimental source fork: adds **Request Super Resolution (NVIDIA RTX)** to the Video settings. The option defaults to off. Windows compilation and NVIDIA hardware validation are still required; no tested executable is included. See [build, usage and validation notes](docs/RTX-SUPER-RESOLUTION.md).
++
+ <p align="center">
+   <img src="assets/icon.png" alt="TackleCast" width="128">
+ </p>
+@@ -90,4 +92,3 @@ src/
+ ## License
+ 
+ MIT
+-
+diff --git a/START-HERE.md b/START-HERE.md
+new file mode 100644
+index 0000000..0b28e5d
+--- /dev/null
++++ b/START-HERE.md
+@@ -0,0 +1,44 @@
++# TackleCast with an experimental RTX Super Resolution option
++
++This package contains modified source, **not a compiled Windows application**.
++The implementation has not been compiled or tested on Windows or an NVIDIA GPU.
++It needs that validation before it can be considered a working release.
++
++## What was added
++
++- **Esc → Video → Request Super Resolution (NVIDIA RTX)**, saved in settings and off by default.
++- A GPU-only bridge from TackleCast's renderer to NVIDIA's D3D11 video-processor extension.
++- Normal rendering when disabled, unsupported, or when processing fails.
++- A status message that distinguishes an accepted request from confirmed NVIDIA activation.
++
++The RTX 3070 Ti is the intended GPU for testing. This does not remove compression
++from the capture card's output; it asks the driver to enhance the decoded image.
++Additional GPU work is required. Its latency has not been measured.
++
++## Build on Windows
++
++1. Extract the entire archive.
++2. Install the build prerequisites listed in `BUILD.md`: Rust MSVC, Visual Studio
++   C++ Build Tools and Windows SDK, LLVM/libclang, and FFmpeg 8 shared development
++   files (headers, libraries and DLLs).
++3. Open PowerShell in this folder and run the following, replacing both paths:
++
++```powershell
++.\Build-RTX.cmd -FFmpegDir C:\ffmpeg -RuntimeDirectory C:\Path\To\OriginalTackleCast -RunTests
++```
++
++`-RuntimeDirectory` is optional; it copies the original application's CUDA/nvJPEG
++DLLs so GPU decoding can remain available. It does not change that installation.
++
++The resulting program is `dist\TackleCast-RTX\TackleCast.exe`.
++Enable RTX Video Super Resolution in NVIDIA settings, open the new program,
++enable its new Video setting, and apply. Use a video viewport at least as large
++as the capture resolution. NVIDIA's Active indicator is the activation check.
++
++If compilation fails, retain the first compiler error. If processing fails,
++retain the status message and application log. Neither failure should be treated
++as evidence that this implementation has been validated.
++
++See `docs/RTX-SUPER-RESOLUTION.md` for implementation details, limitations and the
++Windows test procedure. `changes.patch` contains the changes against upstream
++commit `3e0e198bb810b2e88574b4d0e16ce0b867f3a5ea`.
+diff --git a/build.rs b/build.rs
+index 9f2b0a1..1ad5293 100644
+--- a/build.rs
++++ b/build.rs
+@@ -1,8 +1,21 @@
+ fn main() {
++    println!("cargo:rerun-if-changed=native/rtx_vsr.cpp");
++    println!("cargo:rerun-if-changed=assets/icon.ico");
+     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
++        if std::env::var_os("CARGO_FEATURE_RTX_VSR").is_some() {
++            cc::Build::new()
++                .cpp(true)
++                .file("native/rtx_vsr.cpp")
++                .std("c++17")
++                .flag_if_supported("/EHsc")
++                .define("NOMINMAX", None)
++                .define("WIN32_LEAN_AND_MEAN", None)
++                .compile("tacklecast_rtx_vsr");
++            println!("cargo:rustc-link-lib=d3d11");
++            println!("cargo:rustc-link-lib=dxgi");
++        }
+         let mut res = winresource::WindowsResource::new();
+         res.set_icon("assets/icon.ico");
+         res.compile().unwrap();
+     }
+ }
+-
+diff --git a/docs/RTX-SUPER-RESOLUTION.md b/docs/RTX-SUPER-RESOLUTION.md
+new file mode 100644
+index 0000000..802f1e0
+--- /dev/null
++++ b/docs/RTX-SUPER-RESOLUTION.md
+@@ -0,0 +1,64 @@
++# Experimental RTX Super Resolution integration
++
++Status: source implementation; **not compiled or tested on Windows/NVIDIA hardware** in the development environment. This is not a ready-to-run Windows binary. Driver activation, image correctness, resource synchronization and end-to-end latency require the Windows checks below before calling this a working release.
++
++Based on SaltedByte/TackleCast commit `3e0e198bb810b2e88574b4d0e16ce0b867f3a5ea` (version 2.1.0).
++
++## Build and use
++
++Use the prerequisites in `BUILD.md`: Rust x64 MSVC, Visual Studio C++ Build Tools with a Windows SDK, LLVM/libclang, and an FFmpeg 8 shared **development** distribution containing headers, libraries and DLLs. Existing TackleCast runtime DLLs alone are not enough to compile FFmpeg bindings.
++
++From PowerShell in the extracted source folder:
++
++```powershell
++.\Build-RTX.cmd -FFmpegDir C:\ffmpeg -RuntimeDirectory C:\Path\To\OriginalTackleCast -RunTests
++```
++
++The runtime-directory argument is optional. It copies the original package's CUDA/nvJPEG DLLs to the new build folder. The script copies FFmpeg DLLs from the development distribution used to compile, creates `dist\TackleCast-RTX\TackleCast.exe`, and leaves the original installation untouched. Missing CUDA/nvJPEG DLLs cause upstream TackleCast to fall back to CPU decoding, which can affect latency. No NVIDIA Video Effects SDK installation is needed by this integration.
++
++Enable Super resolution in NVIDIA Control Panel or NVIDIA App. Open the new executable and use **Esc → Video → Request Super Resolution (NVIDIA RTX)**. Apply the settings. Use fullscreen for a 1080p capture on a 1080p display; a smaller video viewport bypasses the effect. Quality is controlled in NVIDIA settings.
++
++The setting defaults to off, including for existing settings files. Disabling it restores the normal rendering path. If the bridge fails, normal video remains available; the settings panel shows the failure. To retry after fixing the driver or configuration, apply Off, then apply On.
++
++“Request submitted — verify in NVIDIA App” confirms that the driver's extension request was accepted and a video-processor blit was submitted. It **does not prove** that NVIDIA's AI model is active. Check the driver's Active indicator with the video visibly playing. Do not use that label, FPS, or GPU usage as proof of VSR activation.
++
++## Implementation
++
++- The existing capture, nvJPEG decoding, CUDA/DX12 plane buffers, audio and latest-frame delivery stay in place.
++- The optional pass converts the latest YUV planes to full-range BGRA at source resolution using the existing video shader.
++- A D3D12 buffer-to-texture GPU copy feeds a shared D3D11 texture on the **same adapter**.
++- One D3D11 video processor converts BGRA to BT.709 studio-range NV12. A second requests NVIDIA PPE Super Resolution, then produces full-range BGRA at the video viewport size.
++- The result returns through another GPU buffer copy to a normal wgpu texture. Letterboxing and UI are composited afterward, so the UI is not AI-processed.
++- There is no desktop/window capture, CPU frame readback, video encoder, NVIDIA proprietary DLL bundle, or frame interpolation.
++- There are additional GPU copies, color conversion and cross-API synchronization. This is GPU-only, but it is **not zero-overhead**. No latency improvement over MPC-BE, or preservation of TackleCast's original latency, has been measured.
++- Source frames are limited to even dimensions, 360–1440 lines, maximum width 2560; output is at least source size and at most 8192 in each dimension. Limits are local eligibility rules, not a promise of driver support. Same-resolution cleanup is requested as well as enlargement.
++- The RGB/NV12 round trip reduces chroma to 4:2:0. Check fine colored text and level ramps; the effect may not improve every image.
++
++### Synchronization and ownership
++
++The render thread is the only thread submitting wgpu/native render work. Native D3D12 copies use wgpu's own direct queue. Buffer resources are application-owned, wrapped with `create_buffer_from_hal`, and initialized by wgpu before native writes. D3D12 buffers decay to COMMON across ExecuteCommandLists submissions. Shared textures explicitly return to COMMON at each D3D11/D3D12 handoff.
++
++Each frame orders operations as: wgpu input pass/copy → native D3D12 input copy and fence signal → D3D11 GPU wait and two video blits → D3D11 signal/flush → D3D12 GPU wait and output copy → wgpu output copy and composition. Each API retains its resource references. Three immutable pairs of copy command lists are recycled only after their completion fence is reached. If all are busy, that frame uses the original image instead of waiting on the CPU. Completed enhanced frames can be reused for UI-only redraws.
++
++Only teardown/size changes wait on the CPU, with a five-second limit. If a driver stalls and completion cannot be established, the native bridge deliberately retains its resources until process exit rather than freeing GPU-in-use memory. Device removal allows normal cleanup. This is a recovery mechanism, not a latency optimization.
++
++## Validation required on Windows
++
++1. Run `cargo test --locked --target x86_64-pc-windows-msvc` and `cargo build --release --locked --target x86_64-pc-windows-msvc`. Also build with `--no-default-features --features gpu-decode` to check the original path without the native bridge.
++2. Run `TackleCast.exe --test`. Verify orientation, aspect ratio, black/white levels and color bars before and after enabling the request. Check both equal-size output and enlargement.
++3. Use the UGREEN 25854 at MJPEG 1920×1080 60 fps. Verify actual NVIDIA activation, compare static text and moving content, and compare both on/off on the same monitor.
++4. Resize, minimize/restore, toggle fullscreen, move between displays, apply On/Off repeatedly, change capture size, unplug/replug the card and exit during playback. Check for stale frames, crashes, unbounded memory growth and repeated failures in `logs`.
++5. For developer validation, enable Windows Graphics Tools/D3D debug validation and run with `TACKLECAST_VSR_DEBUG=1`. Resolve GPU resource/state/fence errors before shipping.
++6. Measure end-to-end latency with a high-speed camera showing the source and capture preview together, or a controlled mirrored timer. Compare the original executable, this build with the option off, and this build with it on at the same source mode, monitor refresh, window size and NVIDIA quality. FPS and render-stage timing do not measure capture latency.
++
++Local inspection covered settings wiring, feature gating, error paths and the queue/fence ordering design. This environment could not run Rust tests, compile the C++/Rust Windows code, or validate the shaders/GPU behavior. Those checks remain outstanding.
++
++## API references
++
++- [NVIDIA RTX Video FAQ](https://nvidia.custhelp.com/app/answers/detail/a_id/5448/~/rtx-video-faq)
++- [Chromium NVIDIA PPE request ABI](https://chromium.googlesource.com/chromium/src/+/refs/tags/146.0.7676.5/ui/gl/swap_chain_presenter.cc) (`ToggleNvidiaVpSuperResolution`)
++- [MPC Video Renderer request/activation distinction](https://github.com/Aleksoid1978/VideoRenderer/wiki/Super-Resolution)
++- [Microsoft shared resources](https://learn.microsoft.com/en-us/windows/win32/direct3d12/shared-heaps)
++- [Microsoft resource promotion and decay](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12)
++
++Implementation is under the repository's MIT license. The NVIDIA driver extension's identifier and parameter values describe an external API; no MPC Video Renderer implementation or proprietary NVIDIA runtime is bundled.
+diff --git a/native/rtx_vsr.cpp b/native/rtx_vsr.cpp
+new file mode 100644
+index 0000000..2e748ab
+--- /dev/null
++++ b/native/rtx_vsr.cpp
+@@ -0,0 +1,298 @@
++// Copyright (c) 2026 TackleCast contributors. MIT, see ../LICENSE.
++// GPU-only D3D12 -> D3D11 VideoProcessor -> D3D12 bridge.
++// All entry points run on the render thread, between wgpu queue submissions.
++#include <windows.h>
++#include <d3d11_4.h>
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <memory>
++#include <stdexcept>
++
++using Microsoft::WRL::ComPtr;
++
++namespace {
++struct Failure { HRESULT hr; const char* operation; };
++void check(HRESULT hr, const char* op) { if (FAILED(hr)) throw Failure{hr, op}; }
++struct Handle {
++    HANDLE value = nullptr;
++    ~Handle() { if (value) CloseHandle(value); }
++};
++struct Processor {
++    ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
++    ComPtr<ID3D11VideoProcessor> processor;
++    ComPtr<ID3D11VideoProcessorInputView> input;
++    ComPtr<ID3D11VideoProcessorOutputView> output;
++};
++struct Slot {
++    std::array<ComPtr<ID3D12CommandAllocator>, 2> allocators;
++    std::array<ComPtr<ID3D12GraphicsCommandList>, 2> lists;
++    UINT64 completion = 0;
++};
++struct Bridge {
++    ComPtr<ID3D12Device> d12;
++    ComPtr<ID3D12CommandQueue> queue;
++    ComPtr<ID3D11Device5> d11;
++    ComPtr<ID3D11DeviceContext4> context;
++    ComPtr<ID3D11VideoDevice> video;
++    ComPtr<ID3D11VideoContext1> video_context;
++    ComPtr<ID3D12Resource> input_buffer, output_buffer;
++    ComPtr<ID3D11Texture2D> rgb_input, nv12, rgb_output;
++    ComPtr<ID3D12Resource> shared_input, shared_output;
++    ComPtr<ID3D12Fence> to11, to12, done;
++    ComPtr<ID3D11Fence> to11_view, to12_view;
++    Processor conversion, enhancement;
++    std::array<Slot, 3> slots;
++    UINT64 serial = 0;
++    bool poisoned = false;
++
++    void shared_texture(UINT w, UINT h, ComPtr<ID3D11Texture2D>& texture,
++                        ComPtr<ID3D12Resource>& resource) {
++        D3D11_TEXTURE2D_DESC td = {};
++        td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
++        check(d11->CreateTexture2D(&td, nullptr, &texture), "Create shared texture");
++        ComPtr<IDXGIResource1> dxgi;
++        check(texture.As(&dxgi), "Query shared texture");
++        Handle handle;
++        check(dxgi->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ |
++            DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle.value), "Share texture");
++        check(d12->OpenSharedHandle(handle.value, IID_PPV_ARGS(&resource)), "Open shared texture");
++    }
++
++    void shared_fence(ComPtr<ID3D12Fence>& f12, ComPtr<ID3D11Fence>& f11) {
++        check(d12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&f12)), "Create shared fence");
++        Handle handle;
++        check(d12->CreateSharedHandle(f12.Get(), nullptr, GENERIC_ALL, nullptr,
++                                     &handle.value), "Share fence");
++        check(d11->OpenSharedFence(handle.value, IID_PPV_ARGS(&f11)), "Open shared fence");
++    }
++
++    void processor(Processor& p, ID3D11Texture2D* input, ID3D11Texture2D* output,
++                   UINT iw, UINT ih, UINT ow, UINT oh, bool enhance) {
++        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
++        cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
++        cd.InputWidth = iw; cd.InputHeight = ih;
++        cd.OutputWidth = ow; cd.OutputHeight = oh;
++        cd.InputFrameRate = cd.OutputFrameRate = {60, 1};
++        cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
++        check(video->CreateVideoProcessorEnumerator(&cd, &p.enumerator), "Create video enumerator");
++        auto require_format = [&](DXGI_FORMAT format, UINT flag) {
++            UINT support = 0;
++            check(p.enumerator->CheckVideoProcessorFormat(format, &support), "Check video format");
++            if (!(support & flag)) throw Failure{E_NOTIMPL, "Required video format unsupported"};
++        };
++        require_format(enhance ? DXGI_FORMAT_NV12 : DXGI_FORMAT_B8G8R8A8_UNORM,
++                       D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT);
++        require_format(enhance ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_NV12,
++                       D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT);
++        check(video->CreateVideoProcessor(p.enumerator.Get(), 0, &p.processor), "Create video processor");
++        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv = {};
++        iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
++        check(video->CreateVideoProcessorInputView(input, p.enumerator.Get(), &iv, &p.input), "Create video input");
++        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
++        ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
++        check(video->CreateVideoProcessorOutputView(output, p.enumerator.Get(), &ov, &p.output), "Create video output");
++        RECT src{0, 0, static_cast<LONG>(iw), static_cast<LONG>(ih)};
++        RECT dst{0, 0, static_cast<LONG>(ow), static_cast<LONG>(oh)};
++        video_context->VideoProcessorSetStreamFrameFormat(p.processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
++        video_context->VideoProcessorSetStreamSourceRect(p.processor.Get(), 0, TRUE, &src);
++        video_context->VideoProcessorSetStreamDestRect(p.processor.Get(), 0, TRUE, &dst);
++        video_context->VideoProcessorSetOutputTargetRect(p.processor.Get(), TRUE, &dst);
++        video_context->VideoProcessorSetStreamAutoProcessingMode(p.processor.Get(), 0, FALSE);
++        // Existing TackleCast shader provides full-range SDR RGB. Convert to
++        // studio-range BT.709 NV12 explicitly, then back to full-range RGB.
++        video_context->VideoProcessorSetStreamColorSpace1(p.processor.Get(), 0,
++            enhance ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
++        video_context->VideoProcessorSetOutputColorSpace1(p.processor.Get(),
++            enhance ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
++        if (enhance) {
++            // NVIDIA PPE stream-extension ABI, also documented by Chromium's
++            // ToggleNvidiaVpSuperResolution. S_OK confirms request acceptance
++            // only. The NVIDIA App reports actual model activation.
++            const GUID ppe = {0xd43ce1b3, 0x1f4b, 0x48ac,
++                {0xba, 0xee, 0xc3, 0xc2, 0x53, 0x75, 0xe6, 0xf7}};
++            struct { UINT version, method, enable; } request{1, 2, 1};
++            HRESULT hr = video_context->VideoProcessorSetStreamExtension(
++                p.processor.Get(), 0, &ppe, sizeof(request), &request);
++            if (hr != S_OK) throw Failure{FAILED(hr) ? hr : E_NOTIMPL, "NVIDIA Super Resolution request rejected"};
++        }
++    }
++
++    static void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
++                        D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
++        D3D12_RESOURCE_BARRIER b = {};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
++        list->ResourceBarrier(1, &b);
++    }
++
++    void record_copy(ID3D12GraphicsCommandList* list, bool into11, UINT w, UINT h, UINT pitch) {
++        auto* texture = into11 ? shared_input.Get() : shared_output.Get();
++        auto* buffer = into11 ? input_buffer.Get() : output_buffer.Get();
++        D3D12_TEXTURE_COPY_LOCATION tex = {};
++        tex.pResource = texture; tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        D3D12_TEXTURE_COPY_LOCATION buf = {};
++        buf.pResource = buffer; buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        buf.PlacedFootprint.Footprint = {DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 1, pitch};
++        // Textures return to COMMON before crossing API boundaries. Buffers
++        // decay to COMMON after ExecuteCommandLists (including wgpu's submits).
++        auto state = into11 ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
++        barrier(list, texture, D3D12_RESOURCE_STATE_COMMON, state);
++        if (into11) list->CopyTextureRegion(&tex, 0, 0, 0, &buf, nullptr);
++        else list->CopyTextureRegion(&buf, 0, 0, 0, &tex, nullptr);
++        barrier(list, texture, state, D3D12_RESOURCE_STATE_COMMON);
++        check(list->Close(), "Close copy commands");
++    }
++
++    Bridge(ID3D12Device* device, ID3D12CommandQueue* q,
++           ID3D12Resource* in, ID3D12Resource* out,
++           UINT iw, UINT ih, UINT ow, UINT oh, UINT ip, UINT op) {
++        d12 = device; queue = q; input_buffer = in; output_buffer = out;
++        ComPtr<IDXGIFactory4> factory;
++        check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Create DXGI factory");
++        ComPtr<IDXGIAdapter1> adapter;
++        check(factory->EnumAdapterByLuid(d12->GetAdapterLuid(), IID_PPV_ARGS(&adapter)), "Find rendering adapter");
++        DXGI_ADAPTER_DESC1 desc = {};
++        check(adapter->GetDesc1(&desc), "Read adapter");
++        if (desc.VendorId != 0x10de) throw Failure{E_NOTIMPL, "RTX Super Resolution requires an NVIDIA adapter"};
++        ComPtr<ID3D11Device> base;
++        ComPtr<ID3D11DeviceContext> base_context;
++        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
++        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
++        wchar_t debug[2] = {};
++        if (GetEnvironmentVariableW(L"TACKLECAST_VSR_DEBUG", debug, 2) && debug[0] == L'1')
++            flags |= D3D11_CREATE_DEVICE_DEBUG;
++        check(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
++            levels, 2, D3D11_SDK_VERSION, &base, nullptr, &base_context), "Create D3D11 video device");
++        check(base.As(&d11), "D3D11 shared-fence device unavailable");
++        check(base_context.As(&context), "D3D11 shared-fence context unavailable");
++        check(base.As(&video), "Query video device");
++        check(base_context.As(&video_context), "Query video context");
++        shared_texture(iw, ih, rgb_input, shared_input);
++        shared_texture(ow, oh, rgb_output, shared_output);
++        D3D11_TEXTURE2D_DESC td = {};
++        td.Width = iw; td.Height = ih; td.MipLevels = td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_NV12; td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET;
++        check(d11->CreateTexture2D(&td, nullptr, &nv12), "Create NV12 intermediate");
++        processor(conversion, rgb_input.Get(), nv12.Get(), iw, ih, iw, ih, false);
++        processor(enhancement, nv12.Get(), rgb_output.Get(), iw, ih, ow, oh, true);
++        shared_fence(to11, to11_view);
++        shared_fence(to12, to12_view);
++        check(d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)), "Create completion fence");
++        // Command lists are immutable for this source/destination size.
++        // Never reset/reuse a slot until its GPU completion is observed.
++        for (auto& slot : slots) {
++            for (int i = 0; i < 2; ++i) {
++                check(d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
++                      IID_PPV_ARGS(&slot.allocators[i])), "Create copy allocator");
++                check(d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
++                    slot.allocators[i].Get(), nullptr, IID_PPV_ARGS(&slot.lists[i])), "Create copy list");
++                record_copy(slot.lists[i].Get(), i == 0, i == 0 ? iw : ow,
++                            i == 0 ? ih : oh, i == 0 ? ip : op);
++            }
++        }
++    }
++
++    HRESULT process() {
++        if (poisoned) throw Failure{E_FAIL, "Video bridge needs reinitialization"};
++        check(d12->GetDeviceRemovedReason(), "D3D12 device removed");
++        const UINT64 completed = done->GetCompletedValue();
++        Slot* available = nullptr;
++        for (auto& slot : slots) if (slot.completion <= completed) { available = &slot; break; }
++        if (!available) return S_FALSE; // bypass this frame instead of adding a CPU wait
++        const UINT64 value = ++serial;
++        ID3D12CommandList* first[] = {available->lists[0].Get()};
++        queue->ExecuteCommandLists(1, first);
++        check(queue->Signal(to11.Get(), value), "Signal D3D12 input");
++        check(context->Wait(to11_view.Get(), value), "Wait for D3D12 input");
++        auto blit = [&](Processor& p) {
++            D3D11_VIDEO_PROCESSOR_STREAM stream = {};
++            stream.Enable = TRUE; stream.pInputSurface = p.input.Get();
++            return video_context->VideoProcessorBlt(p.processor.Get(), p.output.Get(), 0, 1, &stream);
++        };
++        HRESULT converted = blit(conversion);
++        HRESULT enhanced = FAILED(converted) ? converted : blit(enhancement);
++        // Establish completion even when a blit fails. Never enqueue a D3D12
++        // wait for a D3D11 signal that was not successfully submitted.
++        check(context->Signal(to12_view.Get(), value), "Signal D3D11 output");
++        context->Flush();
++        check(queue->Wait(to12.Get(), value), "Wait for D3D11 output");
++        if (SUCCEEDED(enhanced)) {
++            ID3D12CommandList* second[] = {available->lists[1].Get()};
++            queue->ExecuteCommandLists(1, second);
++        }
++        check(queue->Signal(done.Get(), value), "Signal copy completion");
++        available->completion = value;
++        check(enhanced, "Video processing failed");
++        return S_OK;
++    }
++
++    bool idle() {
++        // Only teardown/reconfiguration can wait on the CPU. If a driver hangs,
++        // retain this object rather than freeing resources still in GPU use.
++        // A removed device no longer executes work and can be released normally.
++        if (FAILED(d12->GetDeviceRemovedReason())) return true;
++        context->Flush();
++        Handle event;
++        event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++        if (!event.value) return false;
++        const UINT64 value = ++serial;
++        if (FAILED(context->Signal(to12_view.Get(), value))) return false;
++        context->Flush();
++        if (FAILED(queue->Wait(to12.Get(), value))) return false;
++        if (FAILED(queue->Signal(done.Get(), value))) return false;
++        if (FAILED(done->SetEventOnCompletion(value, event.value))) return false;
++        return WaitForSingleObject(event.value, 5000) == WAIT_OBJECT_0;
++    }
++};
++
++void error_text(char* out, size_t capacity, const Failure& e) {
++    if (out && capacity) std::snprintf(out, capacity, "%s (0x%08lX)", e.operation,
++                                     static_cast<unsigned long>(e.hr));
++}
++} // namespace
++
++extern "C" {
++// Pointers are borrowed at the boundary; Bridge retains its own COM references.
++void* tc_vsr_create(void* device, void* queue, void* input, void* output,
++                    UINT iw, UINT ih, UINT ow, UINT oh, UINT ip, UINT op,
++                    char* error, size_t capacity) noexcept {
++    try {
++        if (!device || !queue || !input || !output || !iw || !ih || !ow || !oh ||
++            iw > 2560 || ih < 360 || ih > 1440 || ow < iw || oh < ih ||
++            ow > 8192 || oh > 8192 || (iw & 1) || (ih & 1) ||
++            ip < iw * 4 || op < ow * 4 || (ip & 255) || (op & 255))
++            throw Failure{E_INVALIDARG, "Invalid video bridge dimensions"};
++        return new Bridge(static_cast<ID3D12Device*>(device), static_cast<ID3D12CommandQueue*>(queue),
++            static_cast<ID3D12Resource*>(input), static_cast<ID3D12Resource*>(output),
++            iw, ih, ow, oh, ip, op);
++    } catch (const Failure& e) { error_text(error, capacity, e); }
++      catch (...) { error_text(error, capacity, {E_FAIL, "Could not initialize video bridge"}); }
++    return nullptr;
++}
++// 0 = processed; 1 = busy, bypass; negative = failed, disable until retried.
++int tc_vsr_process(void* bridge, char* error, size_t capacity) noexcept {
++    if (!bridge) return -1;
++    auto* b = static_cast<Bridge*>(bridge);
++    try { return b->process() == S_OK ? 0 : 1; }
++    catch (const Failure& e) { b->poisoned = true; error_text(error, capacity, e); }
++    catch (...) { b->poisoned = true; error_text(error, capacity, {E_FAIL, "Video bridge exception"}); }
++    return -1;
++}
++// False means a hung driver required retaining resources until process exit.
++bool tc_vsr_destroy(void* bridge) noexcept {
++    auto* b = static_cast<Bridge*>(bridge);
++    if (!b) return true;
++    if (!b->idle()) return false;
++    delete b;
++    return true;
++}
++}
+diff --git a/scripts/build_rtx.ps1 b/scripts/build_rtx.ps1
+new file mode 100644
+index 0000000..5b059f1
+--- /dev/null
++++ b/scripts/build_rtx.ps1
+@@ -0,0 +1,72 @@
++param(
++    [string]$FFmpegDir = $env:FFMPEG_DIR,
++    [string]$RuntimeDirectory,
++    [switch]$RunTests
++)
++$ErrorActionPreference = 'Stop'
++Set-StrictMode -Version Latest
++Push-Location (Split-Path $PSScriptRoot -Parent)
++try {
++    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
++        throw 'Install Rust for Windows (MSVC, x64) from https://rustup.rs and open a new terminal.'
++    }
++    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
++        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
++        if (Test-Path $vswhere) {
++            $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
++            if ($installation) {
++                $devShell = Join-Path $installation 'Common7\Tools\Launch-VsDevShell.ps1'
++                & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
++            }
++        }
++    }
++    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
++        throw 'Install Visual Studio 2022 Build Tools with Desktop development with C++ and a Windows 10/11 SDK.'
++    }
++    if (-not $FFmpegDir) {
++        throw 'Specify an FFmpeg 8 shared development build: .\Build-RTX.cmd -FFmpegDir C:\ffmpeg . The directory must contain include, lib, and bin.'
++    }
++    $env:FFMPEG_DIR = (Resolve-Path $FFmpegDir).Path
++    foreach ($part in @('include\libavcodec\avcodec.h', 'lib', 'bin')) {
++        if (-not (Test-Path (Join-Path $env:FFMPEG_DIR $part))) {
++            throw "FFMPEG_DIR is missing $part. A runtime-only TackleCast folder is insufficient to compile. See BUILD.md."
++        }
++    }
++    if (-not $env:LIBCLANG_PATH) {
++        $clang = Join-Path $env:ProgramFiles 'LLVM\bin'
++        if (Test-Path (Join-Path $clang 'libclang.dll')) { $env:LIBCLANG_PATH = $clang }
++    }
++    if (-not $env:LIBCLANG_PATH -or -not (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
++        throw 'Install LLVM with libclang, or set LIBCLANG_PATH to the directory containing libclang.dll.'
++    }
++    $env:PATH = "$(Join-Path $env:FFMPEG_DIR 'bin');$env:PATH"
++    if ($RunTests) {
++        & cargo test --locked --target x86_64-pc-windows-msvc
++        if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
++    }
++    & cargo build --release --locked --target x86_64-pc-windows-msvc
++    if ($LASTEXITCODE -ne 0) { throw 'Compilation failed; preserve the first compiler error for diagnosis.' }
++    $destination = Join-Path (Get-Location) 'dist\TackleCast-RTX'
++    New-Item -ItemType Directory -Force -Path $destination | Out-Null
++    if ($RuntimeDirectory) {
++        # Keep the existing installation untouched. Copy only CUDA runtime DLLs;
++        # FFmpeg DLLs below must match the headers/libs used for this build.
++        foreach ($pattern in @('nvjpeg*.dll', 'cudart*.dll')) {
++            Get-ChildItem -Path $RuntimeDirectory -Filter $pattern -File |
++                Copy-Item -Destination $destination -Force
++        }
++    }
++    Get-ChildItem -Path (Join-Path $env:FFMPEG_DIR 'bin') -Filter '*.dll' -File |
++        Copy-Item -Destination $destination -Force
++    Copy-Item 'target\x86_64-pc-windows-msvc\release\tacklecast.exe' (Join-Path $destination 'TackleCast.exe') -Force
++    $assetDestination = Join-Path $destination 'assets'
++    New-Item -ItemType Directory -Force -Path $assetDestination | Out-Null
++    Copy-Item 'assets\*' $assetDestination -Recurse -Force
++    Copy-Item 'LICENSE' $destination -Force
++    Copy-Item 'docs\RTX-SUPER-RESOLUTION.md' $destination -Force
++    Write-Host "Build complete: $destination\TackleCast.exe"
++    Write-Host 'For GPU MJPEG decoding, include nvjpeg64_13.dll and cudart64_13.dll from the original TackleCast package or CUDA installation.'
++    Write-Host 'Enable NVIDIA RTX Video Super Resolution, then Esc > Video > Request Super Resolution in TackleCast.'
++} finally {
++    Pop-Location
++}
+diff --git a/src/main.rs b/src/main.rs
+index b98ce7f..369847a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,6 +11,7 @@ mod gpu_decode;
+ mod gpu_monitor;
+ mod logger;
+ mod render;
++mod rtx_vsr;
+ mod settings;
+ mod triple_buffer;
+ mod ui;
+@@ -314,6 +315,7 @@ impl ApplicationHandler<AppEvent> for App {
+         let renderer = match pollster::block_on(Renderer::new(
+             window.clone(),
+             self.settings.scaling_filter,
++            self.settings.request_super_resolution,
+         )) {
+             Ok(renderer) => renderer,
+             Err(error) => {
+@@ -425,6 +427,7 @@ impl ApplicationHandler<AppEvent> for App {
+                 }
+                 let overlay = self.overlay_info();
+                 if let (Some(renderer), Some(ui)) = (&mut self.renderer, &mut self.ui) {
++                    let super_resolution_status = renderer.super_resolution_status().to_owned();
+                     let prepared_ui = ui.prepare(
+                         window,
+                         UiFrame {
+@@ -434,6 +437,7 @@ impl ApplicationHandler<AppEvent> for App {
+                             audio_inputs: &self.audio_inputs,
+                             audio_outputs: &self.audio_outputs,
+                             is_fullscreen: self.is_fullscreen,
++                            super_resolution_status: &super_resolution_status,
+                         },
+                     );
+                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
+@@ -609,6 +613,12 @@ impl App {
+             self.audio.set_volume(self.settings.volume);
+         }
+ 
++        if old_settings.request_super_resolution != self.settings.request_super_resolution {
++            if let Some(renderer) = &mut self.renderer {
++                renderer.set_super_resolution(self.settings.request_super_resolution);
++            }
++        }
++
+         if scaling_changed {
+             if let Some(renderer) = &mut self.renderer {
+                 renderer.set_scale_filter(self.settings.scaling_filter);
+diff --git a/src/render.rs b/src/render.rs
+index 2f777b7..c764c81 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -12,6 +12,9 @@ use wgpu::{CompositeAlphaMode, PresentMode, SurfaceConfiguration, TextureUsages}
+ use winit::dpi::PhysicalSize;
+ use winit::window::Window;
+ 
++#[cfg(all(windows, feature = "rtx-vsr"))]
++mod vsr;
++
+ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+     r: 10.0 / 255.0,
+     g: 10.0 / 255.0,
+@@ -20,6 +23,12 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+ };
+ 
+ pub struct Renderer {
++    request_super_resolution: bool,
++    super_resolution_status: String,
++    vsr_failed: bool,
++    frame_serial: u64,
++    #[cfg(all(windows, feature = "rtx-vsr"))]
++    vsr: Option<vsr::VsrRender>,
+     window: Arc<Window>,
+     surface: wgpu::Surface<'static>,
+     device: wgpu::Device,
+@@ -49,6 +58,7 @@ impl Renderer {
+     pub async fn new(
+         window: Arc<Window>,
+         scale_filter: ScaleFilter,
++        request_super_resolution: bool,
+     ) -> Result<Self, RenderError> {
+         let size = window.inner_size();
+         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
+@@ -223,6 +233,12 @@ impl Renderer {
+         let egui_renderer = EguiRenderer::new(&device, surface_format, None, 1, false);
+ 
+         Ok(Self {
++            request_super_resolution,
++            super_resolution_status: if request_super_resolution { "Waiting for video" } else { "Off" }.to_owned(),
++            vsr_failed: false,
++            frame_serial: 0,
++            #[cfg(all(windows, feature = "rtx-vsr"))]
++            vsr: None,
+             window,
+             surface,
+             device,
+@@ -267,7 +283,82 @@ impl Renderer {
+         self.scale_filter = filter;
+     }
+ 
++    pub fn super_resolution_status(&self) -> &str {
++        &self.super_resolution_status
++    }
++
++    pub fn set_super_resolution(&mut self, enabled: bool) {
++        self.request_super_resolution = enabled;
++        self.vsr_failed = false;
++        #[cfg(all(windows, feature = "rtx-vsr"))]
++        { self.vsr = None; }
++        self.super_resolution_status = if enabled { "Waiting for video" } else { "Off" }.to_owned();
++    }
++
++    fn prepare_super_resolution(&mut self, encoder: &mut wgpu::CommandEncoder,
++                                viewport: Option<Viewport>) -> bool {
++        if !self.request_super_resolution || self.vsr_failed { return false; }
++        #[cfg(all(windows, feature = "rtx-vsr"))]
++        {
++            let (Some(frame), Some(viewport)) = (&self.video_frame, viewport) else {
++                self.super_resolution_status = "Waiting for video".to_owned();
++                return false;
++            };
++            let dimensions = crate::rtx_vsr::Dimensions {
++                input_width: frame.width, input_height: frame.height,
++                output_width: viewport.width.round() as u32,
++                output_height: viewport.height.round() as u32,
++            };
++            if let Err(message) = dimensions.validate() {
++                self.super_resolution_status = message.to_owned();
++                return false;
++            }
++            let rebuild = self.vsr.as_ref().map_or(true, |v|
++                v.dimensions != dimensions || v.format != frame.format);
++            if rebuild {
++                // Tear down the old bridge before allocating its replacement.
++                self.vsr = None;
++                match vsr::VsrRender::new(&self.device, &self.queue, frame,
++                    &self.video_bind_group_layout, &self.video_samplers, self.config.format, dimensions) {
++                    Ok(v) => { self.vsr = Some(v); }
++                    Err(error) => {
++                        tracing::warn!("RTX Super Resolution unavailable: {error}");
++                        self.super_resolution_status = format!("Unavailable: {error}");
++                        self.vsr_failed = true;
++                        return false;
++                    }
++                }
++            }
++            let result = self.vsr.as_mut().expect("VSR initialized").process(
++                &self.device, &self.queue, encoder, self.frame_serial);
++            match result {
++                Ok(true) => {
++                    self.super_resolution_status = "Request submitted — verify in NVIDIA App".to_owned();
++                    true
++                }
++                Ok(false) => {
++                    self.super_resolution_status = "GPU busy — showing original frame".to_owned();
++                    false
++                }
++                Err(error) => {
++                    tracing::warn!("RTX Super Resolution disabled after failure: {error}");
++                    self.super_resolution_status = format!("Unavailable: {error}");
++                    self.vsr_failed = true;
++                    self.vsr = None;
++                    false
++                }
++            }
++        }
++        #[cfg(not(all(windows, feature = "rtx-vsr")))]
++        {
++            let _ = (encoder, viewport);
++            self.super_resolution_status = "This build has no RTX Super Resolution support".to_owned();
++            false
++        }
++    }
++
+     pub fn upload_frame(&mut self, frame: &CaptureFrame) {
++        self.frame_serial = self.frame_serial.wrapping_add(1);
+         match frame {
+             CaptureFrame::Cpu {
+                 width,
+@@ -607,6 +698,9 @@ impl Renderer {
+             );
+         }
+ 
++        let use_super_resolution = self.prepare_super_resolution(&mut encoder, video_viewport);
++        // Used only in feature-enabled builds; keep other builds warning-free.
++        let _ = use_super_resolution;
+         {
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("tacklecast-clear-pass"),
+@@ -626,6 +720,13 @@ impl Renderer {
+             if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
+                 pass.set_pipeline(&self.video_pipeline);
+                 pass.set_bind_group(0, &video_frame.bind_group, &[]);
++                #[cfg(all(windows, feature = "rtx-vsr"))]
++                if use_super_resolution {
++                    if let Some(vsr) = &self.vsr {
++                        pass.set_pipeline(&vsr.pipeline);
++                        pass.set_bind_group(0, &vsr.bind_group, &[]);
++                    }
++                }
+                 pass.set_viewport(
+                     viewport.x,
+                     viewport.y,
+@@ -746,11 +847,30 @@ impl VideoFrameResources {
+         let u_texture = create_plane_texture(device, chroma_width, chroma_height, "u");
+         let v_texture = create_plane_texture(device, chroma_width, chroma_height, "v");
+ 
++        let bind_group = video_bind_group(device, layout, samplers, uniforms,
++                                           &y_texture, &u_texture, &v_texture);
++
++        Self {
++            width,
++            height,
++            format,
++            y_texture,
++            u_texture,
++            v_texture,
++            bind_group,
++        }
++    }
++}
++
++fn video_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
++                    samplers: &VideoSamplers, uniforms: &wgpu::Buffer,
++                    y_texture: &wgpu::Texture, u_texture: &wgpu::Texture,
++                    v_texture: &wgpu::Texture) -> wgpu::BindGroup {
+         let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+         let u_view = u_texture.create_view(&wgpu::TextureViewDescriptor::default());
+         let v_view = v_texture.create_view(&wgpu::TextureViewDescriptor::default());
+ 
+-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++        device.create_bind_group(&wgpu::BindGroupDescriptor {
+             label: Some("tacklecast-video-bind-group"),
+             layout,
+             entries: &[
+@@ -779,18 +899,7 @@ impl VideoFrameResources {
+                     resource: wgpu::BindingResource::Sampler(&samplers.nearest),
+                 }
+             ],
+-        });
+-
+-        Self {
+-            width,
+-            height,
+-            format,
+-            y_texture,
+-            u_texture,
+-            v_texture,
+-            bind_group,
+-        }
+-    }
++        })
+ }
+ 
+ /// Align a byte count up to the next multiple of `alignment`.
+diff --git a/src/render/vsr.rs b/src/render/vsr.rs
+new file mode 100644
+index 0000000..05c40b3
+--- /dev/null
++++ b/src/render/vsr.rs
+@@ -0,0 +1,160 @@
++//! Render-thread resources for the optional RTX video processor.
++use super::*;
++use crate::rtx_vsr::{Bridge, Dimensions};
++use wgpu::util::DeviceExt;
++
++pub(super) struct VsrRender {
++    bridge: Bridge,
++    pub dimensions: Dimensions,
++    pub format: PixelFormat,
++    source: wgpu::Texture,
++    enhanced: wgpu::Texture,
++    source_bind_group: wgpu::BindGroup,
++    source_pipeline: wgpu::RenderPipeline,
++    pub bind_group: wgpu::BindGroup,
++    pub pipeline: wgpu::RenderPipeline,
++    last_serial: Option<u64>,
++}
++
++impl VsrRender {
++    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: &VideoFrameResources,
++               source_layout: &wgpu::BindGroupLayout, samplers: &VideoSamplers,
++               target_format: wgpu::TextureFormat, dimensions: Dimensions) -> Result<Self, String> {
++        let dimensions = dimensions.validate().map_err(str::to_owned)?;
++        let bridge = Bridge::new(device, queue, dimensions)?;
++        let source = texture(device, dimensions.input_width, dimensions.input_height,
++            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
++        let enhanced = texture(device, dimensions.output_width, dimensions.output_height,
++            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
++        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++            label: Some("rtx-vsr-source-uniforms"),
++            contents: bytemuck::bytes_of(&VideoUniforms {
++                format_mode: VideoUniforms::format_mode_for(frame.format),
++                filter_mode: 0,
++                viewport_size: [dimensions.input_width as f32, dimensions.input_height as f32],
++                _padding: [0; 4],
++            }),
++            usage: wgpu::BufferUsages::UNIFORM,
++        });
++        let source_bind_group = video_bind_group(device, source_layout, samplers, &uniforms,
++            &frame.y_texture, &frame.u_texture, &frame.v_texture);
++        let source_pipeline = pipeline(device, source_layout, VIDEO_SHADER, wgpu::TextureFormat::Bgra8Unorm);
++        let output_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("rtx-vsr-display-layout"),
++            entries: &[
++                texture_layout_entry(0),
++                wgpu::BindGroupLayoutEntry {
++                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None,
++                },
++            ],
++        });
++        let enhanced_view = enhanced.create_view(&Default::default());
++        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("rtx-vsr-display-bind-group"), layout: &output_layout,
++            entries: &[
++                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&enhanced_view) },
++                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&samplers.filtering) },
++            ],
++        });
++        let pipeline = pipeline(device, &output_layout, DISPLAY_SHADER, target_format);
++        Ok(Self { bridge, dimensions, format: frame.format, source, enhanced,
++                  source_bind_group, source_pipeline, bind_group, pipeline, last_serial: None })
++    }
++
++    pub fn process(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
++                   encoder: &mut wgpu::CommandEncoder, serial: u64) -> Result<bool, String> {
++        if self.last_serial == Some(serial) { return Ok(true); }
++        let d = self.dimensions;
++        let view = self.source.create_view(&Default::default());
++        let mut prepass = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
++            label: Some("rtx-vsr-input"),
++        });
++        {
++            let mut pass = prepass.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("rtx-vsr-source-rgb"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &view, resolve_target: None,
++                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
++                })],
++                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
++            });
++            pass.set_pipeline(&self.source_pipeline);
++            pass.set_bind_group(0, &self.source_bind_group, &[]);
++            pass.draw(0..6, 0..1);
++        }
++        prepass.copy_texture_to_buffer(
++            image_copy(&self.source),
++            wgpu::TexelCopyBufferInfo { buffer: &self.bridge.input_buffer,
++                layout: wgpu::TexelCopyBufferLayout { offset: 0,
++                    bytes_per_row: Some(d.input_pitch()), rows_per_image: Some(d.input_height) } },
++            extent(d.input_width, d.input_height));
++        queue.submit([prepass.finish()]);
++        if !self.bridge.process()? {
++            // Display the current original frame when the GPU is saturated.
++            // Never freeze on an earlier enhanced frame or wait on the CPU.
++            return Ok(false);
++        }
++        encoder.copy_buffer_to_texture(
++            wgpu::TexelCopyBufferInfo { buffer: &self.bridge.output_buffer,
++                layout: wgpu::TexelCopyBufferLayout { offset: 0,
++                    bytes_per_row: Some(d.output_pitch()), rows_per_image: Some(d.output_height) } },
++            image_copy(&self.enhanced), extent(d.output_width, d.output_height));
++        self.last_serial = Some(serial);
++        Ok(true)
++    }
++}
++
++fn extent(width: u32, height: u32) -> wgpu::Extent3d {
++    wgpu::Extent3d { width, height, depth_or_array_layers: 1 }
++}
++fn image_copy(texture: &wgpu::Texture) -> wgpu::TexelCopyTextureInfo<'_> {
++    wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO,
++                               aspect: wgpu::TextureAspect::All }
++}
++fn texture(device: &wgpu::Device, width: u32, height: u32, usage: wgpu::TextureUsages) -> wgpu::Texture {
++    device.create_texture(&wgpu::TextureDescriptor {
++        label: Some("rtx-vsr-rgb"), size: extent(width, height), mip_level_count: 1,
++        sample_count: 1, dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Bgra8Unorm, usage, view_formats: &[],
++    })
++}
++fn pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
++            source: &str, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
++    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++        label: Some("rtx-vsr-shader"), source: wgpu::ShaderSource::Wgsl(source.into()),
++    });
++    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++        label: Some("rtx-vsr-pipeline-layout"), bind_group_layouts: &[layout], push_constant_ranges: &[],
++    });
++    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        label: Some("rtx-vsr-pipeline"), layout: Some(&layout),
++        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), buffers: &[],
++            compilation_options: Default::default() },
++        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"),
++            targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE),
++                                                   write_mask: wgpu::ColorWrites::ALL })],
++            compilation_options: Default::default() }),
++        primitive: Default::default(), depth_stencil: None, multisample: Default::default(),
++        multiview: None, cache: None,
++    })
++}
++
++const DISPLAY_SHADER: &str = r#"
++@group(0) @binding(0) var image: texture_2d<f32>;
++@group(0) @binding(1) var image_sampler: sampler;
++struct Vertex { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
++@vertex fn vs_main(@builtin(vertex_index) i: u32) -> Vertex {
++    var positions = array<vec2<f32>, 6>(
++        vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
++        vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0));
++    let p = positions[i];
++    var v: Vertex;
++    v.position = vec4(p, 0.0, 1.0);
++    v.uv = vec2((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
++    return v;
++}
++@fragment fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
++    return textureSample(image, image_sampler, v.uv);
++}
++"#;
+diff --git a/src/rtx_vsr.rs b/src/rtx_vsr.rs
+new file mode 100644
+index 0000000..334a610
+--- /dev/null
++++ b/src/rtx_vsr.rs
+@@ -0,0 +1,182 @@
++//! Optional NVIDIA D3D11 video-processor request, fed by TackleCast's D3D12
++//! renderer. No desktop capture, CPU frame readback, or proprietary SDK DLLs.
++//! See docs/RTX-SUPER-RESOLUTION.md for synchronization and validation notes.
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Dimensions {
++    pub input_width: u32,
++    pub input_height: u32,
++    pub output_width: u32,
++    pub output_height: u32,
++}
++
++impl Dimensions {
++    pub fn validate(self) -> Result<Self, &'static str> {
++        if self.input_width == 0 || self.input_height < 360
++            || self.input_width > 2560 || self.input_height > 1440
++            || self.input_width % 2 != 0 || self.input_height % 2 != 0
++        {
++            return Err("Use an even-sized capture between 360p and 1440p");
++        }
++        if self.output_width < self.input_width || self.output_height < self.input_height {
++            return Err("Enlarge the window to at least the capture resolution");
++        }
++        if self.output_width > 8192 || self.output_height > 8192 {
++            return Err("Output exceeds the Super Resolution size limit");
++        }
++        Ok(self)
++    }
++
++    pub fn input_pitch(self) -> u32 { (self.input_width * 4 + 255) & !255 }
++    pub fn output_pitch(self) -> u32 { (self.output_width * 4 + 255) & !255 }
++}
++
++#[cfg(all(windows, feature = "rtx-vsr"))]
++mod native {
++    use super::Dimensions;
++    use std::ffi::{c_char, c_void, CStr};
++    use std::ptr::NonNull;
++    use wgpu::hal::api::Dx12;
++    use windows::core::Interface;
++    use windows::Win32::Graphics::Direct3D12::*;
++    use windows::Win32::Graphics::Dxgi::Common::*;
++
++    extern "C" {
++        fn tc_vsr_create(device: *mut c_void, queue: *mut c_void,
++            input: *mut c_void, output: *mut c_void,
++            iw: u32, ih: u32, ow: u32, oh: u32, ip: u32, op: u32,
++            error: *mut c_char, capacity: usize) -> *mut c_void;
++        fn tc_vsr_process(bridge: *mut c_void, error: *mut c_char, capacity: usize) -> i32;
++        fn tc_vsr_destroy(bridge: *mut c_void) -> bool;
++    }
++
++    pub struct Bridge {
++        pointer: NonNull<c_void>,
++        pub input_buffer: wgpu::Buffer,
++        pub output_buffer: wgpu::Buffer,
++    }
++
++    impl Bridge {
++        pub fn new(device: &wgpu::Device, queue: &wgpu::Queue,
++                   d: Dimensions) -> Result<Self, String> {
++            let mut error = [0 as c_char; 256];
++            // SAFETY: all objects belong to this same DX12 device. The native
++            // object AddRefs every COM pointer before these HAL guards expire.
++            // The renderer serializes native calls with its queue submissions.
++            let created = unsafe {
++                device.as_hal::<Dx12, _, _>(|hal| {
++                    let hal = hal.ok_or_else(|| "Direct3D 12 unavailable".to_owned())?;
++                    let input = buffer(hal.raw_device(), u64::from(d.input_pitch()) * u64::from(d.input_height))?;
++                    let output = buffer(hal.raw_device(), u64::from(d.output_pitch()) * u64::from(d.output_height))?;
++                    let pointer = NonNull::new(tc_vsr_create(
++                        hal.raw_device().as_raw(), hal.raw_queue().as_raw(),
++                        input.as_raw(), output.as_raw(),
++                        d.input_width, d.input_height, d.output_width, d.output_height,
++                        d.input_pitch(), d.output_pitch(), error.as_mut_ptr(), error.len()))
++                        .ok_or_else(|| message(&error, "Video bridge unavailable"))?;
++                    Ok::<_, String>((pointer, input, output))
++                })
++            }?;
++            let (pointer, input, output) = created;
++            let input_buffer = wrap(device, input, u64::from(d.input_pitch()) * u64::from(d.input_height));
++            let output_buffer = wrap(device, output, u64::from(d.output_pitch()) * u64::from(d.output_height));
++            // Initialize through wgpu before any native writes. This marks the
++            // entire buffers initialized so a later read never clears VSR data.
++            let mut encoder = device.create_command_encoder(&Default::default());
++            encoder.clear_buffer(&input_buffer, 0, None);
++            encoder.clear_buffer(&output_buffer, 0, None);
++            queue.submit([encoder.finish()]);
++            Ok(Self { pointer, input_buffer, output_buffer })
++        }
++
++        pub fn process(&mut self) -> Result<bool, String> {
++            let mut error = [0 as c_char; 256];
++            // SAFETY: this uniquely owned pointer is valid until Drop. Calls
++            // occur on the render thread, never concurrently with wgpu submit.
++            match unsafe { tc_vsr_process(self.pointer.as_ptr(), error.as_mut_ptr(), error.len()) } {
++                0 => Ok(true),
++                1 => Ok(false),
++                _ => Err(message(&error, "Video processing failed")),
++            }
++        }
++    }
++
++    impl Drop for Bridge {
++        fn drop(&mut self) {
++            // SAFETY: destroys exactly once, after waiting for native GPU work.
++            if !unsafe { tc_vsr_destroy(self.pointer.as_ptr()) } {
++                tracing::error!("RTX video bridge teardown timed out; GPU resources retained until exit");
++            }
++        }
++    }
++
++    unsafe fn buffer(device: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
++        let heap = D3D12_HEAP_PROPERTIES {
++            Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1,
++            ..Default::default()
++        };
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: size, Height: 1,
++            DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_UNKNOWN,
++            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
++        };
++        let mut resource: Option<ID3D12Resource> = None;
++        device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++            D3D12_RESOURCE_STATE_COMMON, None, &mut resource).map_err(|e| e.to_string())?;
++        resource.ok_or_else(|| "D3D12 buffer creation returned no resource".to_owned())
++    }
++
++    fn wrap(device: &wgpu::Device, resource: ID3D12Resource, size: u64) -> wgpu::Buffer {
++        // SAFETY: matching device, description and ownership; copies on the
++        // same queue use COMMON-state promotion/decay for these buffers.
++        unsafe {
++            device.create_buffer_from_hal::<Dx12>(
++                wgpu::hal::dx12::Device::buffer_from_raw(resource, size),
++                &wgpu::BufferDescriptor { label: Some("rtx-vsr-interop-buffer"), size,
++                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
++                    mapped_at_creation: false })
++        }
++    }
++
++    fn message(buffer: &[c_char], fallback: &str) -> String {
++        // Native snprintf is bounded; buffers begin zero-filled.
++        let message = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy();
++        if message.is_empty() { fallback.to_owned() } else { message.into_owned() }
++    }
++}
++
++#[cfg(all(windows, feature = "rtx-vsr"))]
++pub use native::Bridge;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn hd() -> Dimensions {
++        Dimensions { input_width: 1920, input_height: 1080,
++                     output_width: 1920, output_height: 1080 }
++    }
++    #[test]
++    fn native_resolution_cleanup_is_allowed() { assert!(hd().validate().is_ok()); }
++    #[test]
++    fn enlargement_is_allowed() {
++        assert!(Dimensions { output_width: 2560, output_height: 1440, ..hd() }.validate().is_ok());
++    }
++    #[test]
++    fn downscaling_and_invalid_nv12_are_rejected() {
++        assert!(Dimensions { output_width: 1280, ..hd() }.validate().is_err());
++        assert!(Dimensions { input_width: 1919, ..hd() }.validate().is_err());
++        assert!(Dimensions { input_height: 0, ..hd() }.validate().is_err());
++        assert!(Dimensions { input_width: u32::MAX, ..hd() }.validate().is_err());
++        assert!(Dimensions { output_height: 8193, ..hd() }.validate().is_err());
++    }
++    #[test]
++    fn copy_rows_are_aligned_without_losing_pixels() {
++        let d = Dimensions { input_width: 1922, output_width: 2562, ..hd() };
++        assert!(d.validate().is_ok());
++        assert_eq!(d.input_pitch(), 7936);
++        assert_eq!(d.output_pitch(), 10496);
++        assert_eq!(d.input_pitch() % 256, 0);
++        assert!(d.input_pitch() >= d.input_width * 4);
++    }
++}
+diff --git a/src/settings.rs b/src/settings.rs
+index f8c807b..30606a7 100644
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -18,6 +18,9 @@ pub struct Settings {
+     pub video_device: String,
+     #[serde(default = "default_scaling_filter")]
+     pub scaling_filter: ScaleFilter,
++    /// Optional NVIDIA driver request. Old settings files leave it off.
++    #[serde(default)]
++    pub request_super_resolution: bool,
+     #[serde(default = "default_audio_index")]
+     pub audio_input: i32,
+     #[serde(default = "default_audio_index")]
+@@ -86,6 +89,7 @@ impl Default for Settings {
+         Self {
+             video_device: String::new(),
+             scaling_filter: default_scaling_filter(),
++            request_super_resolution: false,
+             audio_input: default_audio_index(),
+             audio_output: default_audio_index(),
+             resolution: default_resolution(),
+@@ -249,6 +253,7 @@ mod tests {
+ }"#;
+ 
+         let settings: Settings = serde_json::from_str(json).unwrap();
++        assert!(!settings.request_super_resolution);
+         assert_eq!(settings.video_device, "ShadowCast 3");
+         assert_eq!(settings.scaling_filter, ScaleFilter::Bicubic);
+         assert_eq!(settings.audio_input, 15);
+@@ -259,6 +264,13 @@ mod tests {
+         assert!(settings.show_overlay);
+     }
+ 
++    #[test]
++    fn super_resolution_setting_persists() {
++        let settings = Settings { request_super_resolution: true, ..Settings::default() };
++        let decoded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
++        assert!(decoded.request_super_resolution);
++    }
++
+     #[test]
+     fn capture_config_matches_python_logic() {
+         let nv12 = get_capture_config("1080p", 60);
+diff --git a/src/ui.rs b/src/ui.rs
+index 8448734..4354ea0 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -48,6 +48,7 @@ pub struct UiFrame<'a> {
+     pub audio_inputs: &'a [AudioDevice],
+     pub audio_outputs: &'a [AudioDevice],
+     pub is_fullscreen: bool,
++    pub super_resolution_status: &'a str,
+ }
+ 
+ pub struct PreparedUi {
+@@ -133,6 +134,7 @@ impl UiState {
+                     frame.audio_inputs,
+                     frame.audio_outputs,
+                     frame.is_fullscreen,
++                    frame.super_resolution_status,
+                     &mut ui_output,
+                 );
+             }
+@@ -236,6 +238,7 @@ fn draw_menu(
+     audio_inputs: &[AudioDevice],
+     audio_outputs: &[AudioDevice],
+     is_fullscreen: bool,
++    super_resolution_status: &str,
+     output: &mut UiOutput,
+ ) {
+     let screen_rect = ctx.screen_rect();
+@@ -307,6 +310,14 @@ fn draw_menu(
+                             &mut draft.scaling_filter
+                         );
+ 
++                        ui.add_enabled(
++                            cfg!(all(windows, feature = "rtx-vsr")),
++                            Checkbox::new(&mut draft.request_super_resolution, "Request Super Resolution (NVIDIA RTX)"),
++                        ).on_hover_text("Reduces compression artifacts and enhances video. Adds GPU work. Enable RTX Video Super Resolution in NVIDIA settings.");
++                        if draft.request_super_resolution {
++                            ui.label(RichText::new(super_resolution_status).small().color(COLOR_TEXT_SECONDARY));
++                        }
++
+                         if draft.fps_mode == FPS_MODE_CUSTOM {
+                             labeled_custom_fps(ui, draft);
+                             warning_text(

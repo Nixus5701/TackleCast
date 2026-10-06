@@ -1,0 +1,122 @@
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,5 @@
++The presentation menu now includes **Mailbox (low latency, 1 frame)**, a tear-free option for fixed-refresh monitors. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
++
+ This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
+ 
+ # TackleCast
+--- a/START-HERE.md
++++ b/START-HERE.md
+@@ -1,3 +1,5 @@
++For the new tear-free mode: **Esc > Video > Presentation mode > Mailbox (low latency, 1 frame) > Apply**.
++
+ This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
+ 
+ # TackleCast with an experimental RTX Super Resolution option
+--- a/docs/LATENCY-UPDATE.md
++++ b/docs/LATENCY-UPDATE.md
+@@ -3,9 +3,10 @@
+ Extract the full Windows ZIP into a new folder and run TackleCast.exe. Open Esc > Video and choose a Presentation mode, then use the menu's Apply action. The setting is saved across restarts.
+ 
+ - Mailbox (default) preserves the previous mode preference and frame-latency limit of 2.
++- Mailbox (low latency, 1 frame) uses Mailbox with a frame-latency limit of 1. It remains tear-free. If Mailbox is unsupported, this option falls back to FIFO VSync, never Immediate. It can be used with VSR enabled or disabled. Reduced queueing may help latency, but could lower throughput under heavy GPU load. The improvement has not been measured on the capture setup.
+ - Immediate requests presentation with tearing permitted and a frame-latency limit of 1. If unsupported, the renderer uses Mailbox, then AutoVsync. Startup and mode-change logs show both requested and active modes.
+ 
+-Both modes now choose the latest available capture frame after acquiring the display buffer. This prevents a frame chosen before a display wait from being unnecessarily stale when rendering starts. VSR processes the newly selected frame as before.
++All modes choose the latest available capture frame after acquiring the display buffer. This prevents a frame chosen before a display wait from being unnecessarily stale when rendering starts. VSR processes the newly selected frame as before.
+ 
+ Capture format negotiation now retains shared CUDA/DX12 handles through failed opening attempts. NV12-to-MJPEG fallback can use shared GPU storage when the actual capture dimensions match. Resolution fallback with incompatible storage uses the owned decode path. The shared decoder validates JPEG dimensions against its actual allocation, replacing the old hardcoded size assumption.
+ 
+@@ -13,8 +14,8 @@
+ 
+ ## Validation
+ 
+-Windows x64 release compilation passed. Seventeen portable tests passed, including settings persistence/defaults, presentation-mode fallback, GPU storage ownership, existing triple-buffer newest-frame behavior, VSR geometry, and WGSL shader validation. The Windows unit-test executable also builds, but cannot be executed in this environment. No physical capture-card, NVIDIA runtime, tearing, or end-to-end latency measurements were performed. Improvements are implementation changes, not a measured latency guarantee.
++Windows x64 release compilation passed. Seventeen portable tests passed, including settings persistence/defaults, presentation-mode fallback, GPU storage ownership, existing triple-buffer newest-frame behavior, VSR geometry, and WGSL shader validation. The prior Windows unit-test executable compiled. This update was checked with the portable tests and the Windows release build. No physical capture-card, NVIDIA runtime, tearing, or end-to-end latency measurements were performed. Improvements are implementation changes, not a measured latency guarantee.
+ 
+-For an A/B comparison, keep capture format/resolution/FPS, window size, monitor refresh and VSR settings identical. Compare Mailbox and Immediate. The log entry `gpu_decode=true, zero_copy=true` identifies active shared capture storage; `presentation requested=... active=... maximum_frame_latency=...` identifies the actual display mode.
++For an A/B comparison, keep capture format/resolution/FPS, window size, monitor refresh and VSR settings identical. Compare Mailbox, Mailbox (low latency, 1 frame), and Immediate. The log entry `gpu_decode=true, zero_copy=true` identifies active shared capture storage; `presentation requested=... active=... maximum_frame_latency=...` identifies the actual display mode.
+ 
+ This build is based on the source ZIP supplied for the latency audit. The latency-changes.patch file contains changes against that supplied baseline; changes.patch retains the prior VSR changes against upstream. See BUILD.md for the Windows toolchain and scripts/build_rtx.ps1 for packaging. Portable checks run with `cargo test --manifest-path tests/portable/Cargo.toml`.
+--- a/src/presentation.rs
++++ b/src/presentation.rs
+@@ -4,9 +4,13 @@
+ pub fn choose_present_mode(requested: PresentationMode, available: &[PresentMode]) -> PresentMode {
+     let order = match requested {
+         PresentationMode::Mailbox => [PresentMode::Mailbox, PresentMode::Immediate],
++        PresentationMode::MailboxLowLatency => [PresentMode::Mailbox, PresentMode::Fifo],
+         PresentationMode::Immediate => [PresentMode::Immediate, PresentMode::Mailbox],
+     };
+-    order.into_iter().find(|mode| available.contains(mode)).unwrap_or(PresentMode::AutoVsync)
++    order.into_iter().find(|mode| available.contains(mode)).unwrap_or(
++        if requested == PresentationMode::MailboxLowLatency { PresentMode::Fifo }
++        else { PresentMode::AutoVsync }
++    )
+ }
+ 
+ #[cfg(test)]
+@@ -20,6 +24,10 @@
+         assert_eq!(choose_present_mode(PresentationMode::Immediate, &[PresentMode::Mailbox]), PresentMode::Mailbox);
+         assert_eq!(choose_present_mode(PresentationMode::Mailbox, &[PresentMode::Immediate]), PresentMode::Immediate);
+         assert_eq!(choose_present_mode(PresentationMode::Immediate, &[PresentMode::Fifo]), PresentMode::AutoVsync);
++        assert_eq!(choose_present_mode(PresentationMode::MailboxLowLatency, &modes), PresentMode::Mailbox);
++        assert_eq!(choose_present_mode(PresentationMode::MailboxLowLatency, &[PresentMode::Immediate, PresentMode::Fifo]), PresentMode::Fifo);
++        assert_eq!(choose_present_mode(PresentationMode::MailboxLowLatency, &[]), PresentMode::Fifo);
++        assert_eq!(PresentationMode::MailboxLowLatency.frame_latency(), 1);
+         assert_eq!(PresentationMode::Immediate.frame_latency(), 1);
+         assert_eq!(PresentationMode::Mailbox.frame_latency(), 2);
+     }
+@@ -28,9 +36,11 @@
+         let old: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+         assert_eq!(old.presentation_mode, PresentationMode::Mailbox);
+         let mut updated = old;
+-        updated.presentation_mode = PresentationMode::Immediate;
+-        let saved = serde_json::to_string(&updated).unwrap();
+-        let restored: crate::settings::Settings = serde_json::from_str(&saved).unwrap();
+-        assert_eq!(restored, updated);
++        for mode in PresentationMode::ALL {
++            updated.presentation_mode = mode;
++            let saved = serde_json::to_string(&updated).unwrap();
++            let restored: crate::settings::Settings = serde_json::from_str(&saved).unwrap();
++            assert_eq!(restored, updated);
++        }
+     }
+ }
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -91,18 +91,21 @@
+ pub enum PresentationMode {
+     #[default]
+     Mailbox,
++    #[serde(rename = "mailbox_low_latency")]
++    MailboxLowLatency,
+     Immediate,
+ }
+ impl PresentationMode {
+-    pub const ALL: [Self; 2] = [Self::Mailbox, Self::Immediate];
++    pub const ALL: [Self; 3] = [Self::Mailbox, Self::MailboxLowLatency, Self::Immediate];
+     pub fn label(self) -> &'static str {
+         match self {
+             Self::Mailbox => "Mailbox (default)",
++            Self::MailboxLowLatency => "Mailbox (low latency, 1 frame)",
+             Self::Immediate => "Immediate (lowest latency; may tear)",
+         }
+     }
+     pub fn frame_latency(self) -> u32 {
+-        match self { Self::Mailbox => 2, Self::Immediate => 1 }
++        match self { Self::Mailbox => 2, Self::MailboxLowLatency | Self::Immediate => 1 }
+     }
+ }
+ 
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -312,7 +312,7 @@
+                                     ui.selectable_value(&mut draft.presentation_mode, mode, mode.label());
+                                 }
+                             });
+-                        ui.label(RichText::new("Immediate allows tearing and limits queued frames to one. Unsupported modes fall back automatically.").small().color(COLOR_TEXT_SECONDARY));
++                        ui.label(RichText::new("Low-latency Mailbox keeps presentation tear-free with a one-frame limit. Immediate permits tearing. Unsupported modes fall back automatically.").small().color(COLOR_TEXT_SECONDARY));
+ 
+                         scaling_filter_combo(
+                             ui,

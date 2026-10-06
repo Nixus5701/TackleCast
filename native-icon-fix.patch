@@ -1,0 +1,190 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,7 @@
+   "Win32_Devices_FunctionDiscovery",
+   "Win32_System_Threading",
+   "Win32_UI_Shell",
++  "Win32_UI_Shell_PropertiesSystem",
+   "Win32_UI_WindowsAndMessaging",
+   "Win32_Graphics_Direct3D12",
+   "Win32_Graphics_Dxgi_Common",
+--- a/scripts/build_rtx.ps1
++++ b/scripts/build_rtx.ps1
+@@ -66,6 +66,7 @@
+     Copy-Item 'docs\RTX-SUPER-RESOLUTION.md' $destination -Force
+     Copy-Item 'docs\LATENCY-UPDATE.md' $destination -Force
+     Copy-Item 'docs\IMAGE-ADJUSTMENTS.md' $destination -Force
++    Copy-Item 'docs\ICON-FIX.md' $destination -Force
+     Write-Host "Build complete: $destination\TackleCast.exe"
+     Write-Host 'For GPU MJPEG decoding, include nvjpeg64_13.dll and cudart64_13.dll from the original TackleCast package or CUDA installation.'
+     Write-Host 'Enable NVIDIA RTX Video Super Resolution, then Esc > Video > Request Super Resolution in TackleCast.'
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -18,6 +18,8 @@
+ mod settings;
+ mod triple_buffer;
+ mod ui;
++#[cfg(windows)]
++mod window_icon;
+ 
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+@@ -210,26 +212,18 @@
+     }
+ 
+     fn create_window(event_loop: &ActiveEventLoop) -> Window {
+-        // Decode the same ICO that build.rs embeds into the executable.
+-        let icon = image::load_from_memory_with_format(
+-            include_bytes!("../assets/icon.ico"), image::ImageFormat::Ico,
+-        ).map_err(|e| e.to_string()).and_then(|image| {
+-            let rgba = image.into_rgba8();
+-            let (width, height) = rgba.dimensions();
+-            winit::window::Icon::from_rgba(rgba.into_raw(), width, height)
+-                .map_err(|e| e.to_string())
+-        }).map_err(|e| tracing::warn!("Failed to load window icon: {e}")).ok();
+-        let attributes = WindowAttributes::default()
+-            .with_title(WINDOW_TITLE)
+-            .with_resizable(true)
+-            .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
+-            .with_window_icon(icon.clone());
++        let window = event_loop.create_window(
++            WindowAttributes::default()
++                .with_title(WINDOW_TITLE)
++                .with_resizable(true)
++                .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
++                .with_visible(false),
++        ).expect("failed to create window");
+         #[cfg(windows)]
+-        let attributes = {
+-            use winit::platform::windows::WindowAttributesExtWindows;
+-            attributes.with_taskbar_icon(icon)
+-        };
+-        event_loop.create_window(attributes).expect("failed to create window")
++        window_icon::apply(&window, APP_ID);
++        // Let Explorer see the window only after both icons and shell metadata exist.
++        window.set_visible(true);
++        window
+     }
+ 
+     /// Recomputes whether the display should be held awake and pushes the
+--- a/docs/IMAGE-ADJUSTMENTS.md
++++ b/docs/IMAGE-ADJUSTMENTS.md
+@@ -19,7 +19,7 @@
+ 
+ The controls use the existing final fragment shader, with no extra render pass, frame queue, or CPU readback. Non-neutral controls add GPU work, especially sharpness; performance and end-to-end latency have not been measured on an RTX 3070 Ti. The prior fallback, freshest-frame selection, and all three presentation modes remain in this build.
+ 
+-Both title-bar and taskbar icons are now set through winit using the same embedded assets/icon.ico used for the EXE resource. The runtime icon does not depend on a relative working directory or an external assets folder.
++The follow-up icon fix loads assets/icon.ico through the native Windows ICO loader, using a path relative to TackleCast.exe. It assigns separate title-bar and taskbar icon sizes and sets the Windows taskbar icon resource property before displaying the window. The same embedded ICO resource is a fallback when the assets file cannot be loaded. See ICON-FIX.md.
+ 
+ Validation: Windows x64 release build succeeded; 20 portable tests passed, covering settings migration/persistence, invalid control values, both complete WGSL shaders and their uniform layout, icon decoding, and existing latency/VSR checks. No physical capture-card or NVIDIA runtime test was possible in the build environment.
+ 
+--- /dev/null
++++ b/src/window_icon.rs
+@@ -0,0 +1,86 @@
++//! Native Windows ICO loading and taskbar identity. All paths are EXE-relative.
++use std::path::{Path, PathBuf};
++use windows::core::{HSTRING, PROPVARIANT};
++use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
++use windows::Win32::UI::Shell::PropertiesSystem::{
++    IPropertyStore, PROPERTYKEY, PSCoerceToCanonicalValue, PSGetPropertyKeyFromName,
++    SHGetPropertyStoreForWindow,
++};
++use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, ICON_BIG, ICON_SMALL, WM_GETICON};
++use winit::dpi::PhysicalSize;
++use winit::platform::windows::{IconExtWindows, WindowExtWindows};
++use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
++use winit::window::{Icon, Window};
++
++fn asset_path(exe: &Path) -> PathBuf {
++    exe.parent().unwrap_or_else(|| Path::new(".")).join("assets").join("icon.ico")
++}
++
++fn native_icon(path: &Path, side: u32) -> Option<Icon> {
++    let size = Some(PhysicalSize::new(side, side));
++    // LoadImageW reads the actual ICO and selects its native resolution.
++    match Icon::from_path(path, size) {
++        Ok(icon) => {
++            tracing::info!("Native ICO loaded: {} ({side}px)", path.display());
++            Some(icon)
++        }
++        Err(error) => {
++            tracing::warn!("Native ICO load failed: {error}; using embedded icon resource 1");
++            Icon::from_resource(1, size)
++                .map_err(|e| tracing::error!("Embedded icon load failed: {e}"))
++                .ok()
++        }
++    }
++}
++
++pub fn apply(window: &Window, app_id: &str) {
++    let Ok(exe) = std::env::current_exe() else {
++        tracing::error!("Cannot resolve executable path for window icons");
++        return;
++    };
++    let path = asset_path(&exe);
++    let scale = window.scale_factor();
++    // winit retains the owned HICONs for the window's lifetime.
++    window.set_window_icon(native_icon(&path, (16.0 * scale).round().max(16.0) as u32));
++    window.set_taskbar_icon(native_icon(&path, (32.0 * scale).round().max(32.0) as u32));
++
++    let Ok(handle) = window.window_handle() else { return; };
++    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return; };
++    let hwnd = HWND(handle.hwnd.get() as *mut _);
++    // Configure the shell's group/pinned icon as well as the live window icons.
++    if let Err(error) = unsafe { set_taskbar_properties(hwnd, &exe, &path, app_id) } {
++        tracing::warn!("Taskbar icon properties could not be set: {error}");
++    }
++    unsafe {
++        let small = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0));
++        let big = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0));
++        tracing::info!("Native icon fix: window icon assigned={}, taskbar icon assigned={}", small.0 != 0, big.0 != 0);
++    }
++}
++
++unsafe fn set_taskbar_properties(hwnd: HWND, exe: &Path, icon: &Path, app_id: &str) -> windows::core::Result<()> {
++    let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd)?;
++    let icon_reference = if icon.is_file() {
++        format!("{},0", icon.display())
++    } else {
++        // Resource ID 1 is the exact same assets/icon.ico embedded by build.rs.
++        format!("{},-1", exe.display())
++    };
++    let command = format!("\"{}\"", exe.display());
++    // Set relaunch properties before the explicit window AppUserModelID.
++    for (name, value) in [
++        ("System.AppUserModel.RelaunchCommand", command.as_str()),
++        ("System.AppUserModel.RelaunchDisplayNameResource", "TackleCast"),
++        ("System.AppUserModel.RelaunchIconResource", icon_reference.as_str()),
++        ("System.AppUserModel.ID", app_id),
++    ] {
++        let mut key = PROPERTYKEY::default();
++        PSGetPropertyKeyFromName(&HSTRING::from(name), &mut key)?;
++        let mut value = PROPVARIANT::from(value);
++        PSCoerceToCanonicalValue(&key, &mut value)?;
++        store.SetValue(&key, &value)?;
++    }
++    store.Commit()?;
++    tracing::info!("Taskbar icon reference: {icon_reference}");
++    Ok(())
++}
+--- /dev/null
++++ b/docs/ICON-FIX.md
+@@ -0,0 +1,18 @@
++# Native Windows taskbar icon fix
++
++Close the previous TackleCast instance, extract the complete ZIP into a new folder, and launch that folder's TackleCast.exe. Keep assets/icon.ico beside the executable in its assets subfolder. Copy your prior tacklecast_settings.json into the new folder while the app is closed to retain your preferences.
++
++This update loads the actual assets/icon.ico using Windows LoadImageW via winit's native icon API, rather than decoding it to RGBA and reconstructing an icon. Paths are resolved relative to the executable, independent of the launch directory. It uses separate DPI-scaled small and large icons, retains ownership through winit, and falls back to embedded icon resource 1 if loading the file fails.
++
++The window is created hidden; icons and window-level AppUserModel properties are assigned before it is shown. RelaunchIconResource explicitly points Windows to assets/icon.ico,0, with the embedded EXE resource as a fallback when the file is missing. The relaunch command and display name are set together. The existing application ID is preserved.
++
++If you pinned an earlier build, unpin the old shortcut, launch the new EXE directly, and pin its running taskbar button. This package does not modify existing pinned shortcuts or clear the Windows icon cache.
++
++Startup logs now show which native ICO loaded, whether small and large window icon handles were assigned, and the taskbar icon reference. This can distinguish loading errors from Windows shell/shortcut behavior.
++
++Validation: Windows x64 release compilation and bundled-DLL import checks passed. Icon assets are unchanged from the prior package. The 20 portable checks from the image-controls update remain applicable; those checks do not exercise the Windows shell. Visual taskbar behavior could not be verified on a Windows desktop in this environment. No renderer or capture changes are included in this follow-up.
++
++Windows property reference:
++https://learn.microsoft.com/en-us/windows/win32/properties/props-system-appusermodel-relaunchiconresource
++
++native-icon-fix.patch records the changes relative to the image-controls source archive.
