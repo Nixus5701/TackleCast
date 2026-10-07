@@ -346,6 +346,221 @@ struct NvjpegLib {
         *mut NvjpegImage,
         CUstream,
     ) -> NvjpegStatus,
+    /// The decoupled decode API, needed for the GPU-Huffman backend. Absent
+    /// from very old nvJPEG builds.
+    decoupled: Option<DecoupledApi>,
+}
+
+type Opaque = *mut c_void;
+type Status = NvjpegStatus;
+
+/// Entry points of nvJPEG's decoupled API (nvjpeg.h, "Decoder helper
+/// functions" onwards).
+struct DecoupledApi {
+    decoder_create: unsafe extern "system" fn(NvjpegHandle, i32, *mut Opaque) -> Status,
+    decoder_destroy: unsafe extern "system" fn(Opaque) -> Status,
+    decoder_state_create: unsafe extern "system" fn(NvjpegHandle, Opaque, *mut NvjpegJpegState) -> Status,
+    decoder_jpeg_supported: unsafe extern "system" fn(Opaque, Opaque, Opaque, *mut i32) -> Status,
+    stream_create: unsafe extern "system" fn(NvjpegHandle, *mut Opaque) -> Status,
+    stream_destroy: unsafe extern "system" fn(Opaque) -> Status,
+    stream_parse: unsafe extern "system" fn(NvjpegHandle, *const u8, usize, i32, i32, Opaque) -> Status,
+    params_create: unsafe extern "system" fn(NvjpegHandle, *mut Opaque) -> Status,
+    params_destroy: unsafe extern "system" fn(Opaque) -> Status,
+    params_set_output_format: unsafe extern "system" fn(Opaque, i32) -> Status,
+    pinned_create: unsafe extern "system" fn(NvjpegHandle, *mut c_void, *mut Opaque) -> Status,
+    pinned_destroy: unsafe extern "system" fn(Opaque) -> Status,
+    device_create: unsafe extern "system" fn(NvjpegHandle, *mut c_void, *mut Opaque) -> Status,
+    device_destroy: unsafe extern "system" fn(Opaque) -> Status,
+    attach_pinned: unsafe extern "system" fn(NvjpegJpegState, Opaque) -> Status,
+    attach_device: unsafe extern "system" fn(NvjpegJpegState, Opaque) -> Status,
+    decode_jpeg: unsafe extern "system" fn(
+        NvjpegHandle, Opaque, NvjpegJpegState, Opaque, *mut NvjpegImage, Opaque, CUstream,
+    ) -> Status,
+}
+
+impl DecoupledApi {
+    unsafe fn load(lib: &libloading::Library) -> Option<Self> {
+        unsafe {
+            Some(Self {
+                decoder_create: *lib.get(b"nvjpegDecoderCreate\0").ok()?,
+                decoder_destroy: *lib.get(b"nvjpegDecoderDestroy\0").ok()?,
+                decoder_state_create: *lib.get(b"nvjpegDecoderStateCreate\0").ok()?,
+                decoder_jpeg_supported: *lib.get(b"nvjpegDecoderJpegSupported\0").ok()?,
+                stream_create: *lib.get(b"nvjpegJpegStreamCreate\0").ok()?,
+                stream_destroy: *lib.get(b"nvjpegJpegStreamDestroy\0").ok()?,
+                stream_parse: *lib.get(b"nvjpegJpegStreamParse\0").ok()?,
+                params_create: *lib.get(b"nvjpegDecodeParamsCreate\0").ok()?,
+                params_destroy: *lib.get(b"nvjpegDecodeParamsDestroy\0").ok()?,
+                params_set_output_format: *lib.get(b"nvjpegDecodeParamsSetOutputFormat\0").ok()?,
+                pinned_create: *lib.get(b"nvjpegBufferPinnedCreate\0").ok()?,
+                pinned_destroy: *lib.get(b"nvjpegBufferPinnedDestroy\0").ok()?,
+                device_create: *lib.get(b"nvjpegBufferDeviceCreate\0").ok()?,
+                device_destroy: *lib.get(b"nvjpegBufferDeviceDestroy\0").ok()?,
+                attach_pinned: *lib.get(b"nvjpegStateAttachPinnedBuffer\0").ok()?,
+                attach_device: *lib.get(b"nvjpegStateAttachDeviceBuffer\0").ok()?,
+                decode_jpeg: *lib.get(b"nvjpegDecodeJpeg\0").ok()?,
+            })
+        }
+    }
+}
+
+/// nvJPEG's GPU-assisted Huffman backend (NVJPEG_BACKEND_GPU_HYBRID), which
+/// moves entropy decoding from the CPU onto the GPU. Whether that is faster
+/// for one 1080p frame depends on the GPU and CPU, so `BackendSelector`
+/// measures it against the default backend before committing.
+struct GpuHybrid {
+    decoder: Opaque,
+    state: NvjpegJpegState,
+    stream: Opaque,
+    params: Opaque,
+    pinned: Opaque,
+    device: Opaque,
+}
+
+const NVJPEG_BACKEND_GPU_HYBRID: i32 = 2;
+
+impl GpuHybrid {
+    /// Creates every object up front; on any failure, releases what was made.
+    unsafe fn new(lib: &NvjpegLib, handle: NvjpegHandle) -> Option<Self> {
+        let api = lib.decoupled.as_ref()?;
+        let mut hybrid = Self {
+            decoder: ptr::null_mut(),
+            state: ptr::null_mut(),
+            stream: ptr::null_mut(),
+            params: ptr::null_mut(),
+            pinned: ptr::null_mut(),
+            device: ptr::null_mut(),
+        };
+        let ok = unsafe {
+            (api.decoder_create)(handle, NVJPEG_BACKEND_GPU_HYBRID, &mut hybrid.decoder) == NVJPEG_STATUS_SUCCESS
+                && (api.decoder_state_create)(handle, hybrid.decoder, &mut hybrid.state) == NVJPEG_STATUS_SUCCESS
+                && (api.stream_create)(handle, &mut hybrid.stream) == NVJPEG_STATUS_SUCCESS
+                && (api.params_create)(handle, &mut hybrid.params) == NVJPEG_STATUS_SUCCESS
+                && (api.params_set_output_format)(hybrid.params, NVJPEG_OUTPUT_YUV) == NVJPEG_STATUS_SUCCESS
+                && (api.pinned_create)(handle, ptr::null_mut(), &mut hybrid.pinned) == NVJPEG_STATUS_SUCCESS
+                && (api.device_create)(handle, ptr::null_mut(), &mut hybrid.device) == NVJPEG_STATUS_SUCCESS
+                && (api.attach_pinned)(hybrid.state, hybrid.pinned) == NVJPEG_STATUS_SUCCESS
+                && (api.attach_device)(hybrid.state, hybrid.device) == NVJPEG_STATUS_SUCCESS
+        };
+        if ok {
+            Some(hybrid)
+        } else {
+            unsafe { hybrid.destroy(lib) };
+            None
+        }
+    }
+
+    /// Decodes into `image` on `cuda_stream`. `Ok(false)` means this backend
+    /// can't handle the stream and the caller should use the default one.
+    unsafe fn decode(
+        &self,
+        lib: &NvjpegLib,
+        handle: NvjpegHandle,
+        data: &[u8],
+        image: &mut NvjpegImage,
+        cuda_stream: CUstream,
+    ) -> Result<bool, GpuDecodeError> {
+        let api = lib.decoupled.as_ref().expect("GpuHybrid requires the decoupled API");
+        unsafe {
+            let res = (api.stream_parse)(handle, data.as_ptr(), data.len(), 0, 0, self.stream);
+            if res != NVJPEG_STATUS_SUCCESS {
+                return Err(GpuDecodeError::Nvjpeg("nvjpegJpegStreamParse", res));
+            }
+            // 0 means supported.
+            let mut unsupported = 1;
+            let res = (api.decoder_jpeg_supported)(self.decoder, self.stream, self.params, &mut unsupported);
+            if res != NVJPEG_STATUS_SUCCESS || unsupported != 0 {
+                return Ok(false);
+            }
+            let res = (api.decode_jpeg)(handle, self.decoder, self.state, self.stream, image, self.params, cuda_stream);
+            if res != NVJPEG_STATUS_SUCCESS {
+                return Err(GpuDecodeError::Nvjpeg("nvjpegDecodeJpeg", res));
+            }
+        }
+        Ok(true)
+    }
+
+    unsafe fn destroy(&mut self, lib: &NvjpegLib) {
+        let Some(api) = lib.decoupled.as_ref() else { return };
+        unsafe {
+            if !self.state.is_null() { (lib.state_destroy)(self.state); }
+            if !self.pinned.is_null() { (api.pinned_destroy)(self.pinned); }
+            if !self.device.is_null() { (api.device_destroy)(self.device); }
+            if !self.params.is_null() { (api.params_destroy)(self.params); }
+            if !self.stream.is_null() { (api.stream_destroy)(self.stream); }
+            if !self.decoder.is_null() { (api.decoder_destroy)(self.decoder); }
+        }
+        *self = Self {
+            decoder: ptr::null_mut(),
+            state: ptr::null_mut(),
+            stream: ptr::null_mut(),
+            params: ptr::null_mut(),
+            pinned: ptr::null_mut(),
+            device: ptr::null_mut(),
+        };
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    /// nvjpegDecode on the default (CPU-assisted Huffman) backend.
+    Default,
+    GpuHybrid,
+}
+
+/// Times both backends on the live stream, alternating frames so both see
+/// the same content, then keeps the faster by median decode time.
+struct BackendSelector {
+    chosen: Option<Backend>,
+    frame: u32,
+    samples: [Vec<f32>; 2],
+}
+
+/// Frames per backend before deciding (about 1.3 s at 60 fps, both together).
+const TRIAL_FRAMES: usize = 40;
+/// First frames per backend ignored as warm-up (allocations, clocks).
+const WARMUP_FRAMES: u32 = 4;
+
+impl BackendSelector {
+    fn new(gpu_hybrid_available: bool) -> Self {
+        Self {
+            chosen: (!gpu_hybrid_available).then_some(Backend::Default),
+            frame: 0,
+            samples: [Vec::new(), Vec::new()],
+        }
+    }
+
+    fn next(&self) -> Backend {
+        self.chosen.unwrap_or(if self.frame % 2 == 0 { Backend::Default } else { Backend::GpuHybrid })
+    }
+
+    /// Stops trying the GPU backend (unsupported stream, or an error).
+    fn reject_gpu_hybrid(&mut self) {
+        self.chosen = Some(Backend::Default);
+    }
+
+    /// Records one decode; returns the decision and both medians once made.
+    fn record(&mut self, backend: Backend, millis: f32) -> Option<(Backend, f32, f32)> {
+        if self.chosen.is_some() {
+            return None;
+        }
+        if self.frame / 2 >= WARMUP_FRAMES {
+            self.samples[backend as usize].push(millis);
+        }
+        self.frame += 1;
+        if self.samples.iter().any(|s| s.len() < TRIAL_FRAMES) {
+            return None;
+        }
+        let median = |values: &mut Vec<f32>| {
+            values.sort_by(f32::total_cmp);
+            values[values.len() / 2]
+        };
+        let default = median(&mut self.samples[0]);
+        let gpu = median(&mut self.samples[1]);
+        let choice = if gpu < default { Backend::GpuHybrid } else { Backend::Default };
+        self.chosen = Some(choice);
+        Some((choice, default, gpu))
+    }
 }
 
 impl NvjpegLib {
@@ -361,6 +576,7 @@ impl NvjpegLib {
             let state_destroy = *lib.get(b"nvjpegJpegStateDestroy\0").ok()?;
             let get_image_info = *lib.get(b"nvjpegGetImageInfo\0").ok()?;
             let decode = *lib.get(b"nvjpegDecode\0").ok()?;
+            let decoupled = DecoupledApi::load(&lib);
             Some(Self {
                 _lib: lib,
                 create_simple,
@@ -369,6 +585,7 @@ impl NvjpegLib {
                 state_destroy,
                 get_image_info,
                 decode,
+                decoupled,
             })
         }
     }
@@ -513,6 +730,8 @@ pub struct NvjpegDecoder {
     alloc_height: u32,
     // Whether first frame has been validated
     validated: bool,
+    gpu_hybrid: Option<GpuHybrid>,
+    backend: BackendSelector,
 }
 
 /// Returns true if this decoder is using zero-copy shared buffers.
@@ -636,6 +855,7 @@ impl NvjpegDecoder {
                 }
             };
 
+            let gpu_hybrid = GpuHybrid::new(&nvjpeg, handle);
             info!(
                 "nvJPEG GPU decoder initialized in owned mode (pre-allocated for {}x{} YUV 4:2:2)",
                 w, h
@@ -669,6 +889,8 @@ impl NvjpegDecoder {
                 alloc_width: w,
                 alloc_height: h,
                 validated: false,
+                backend: BackendSelector::new(gpu_hybrid.is_some()),
+                gpu_hybrid,
             })
         }
     }
@@ -852,6 +1074,7 @@ impl NvjpegDecoder {
             let alloc_width = import_handles.layout.width;
             let alloc_height = import_handles.layout.height;
 
+            let gpu_hybrid = GpuHybrid::new(&nvjpeg, nvjpeg_handle);
             info!(
                 "nvJPEG GPU decoder initialized in zero-copy mode ({} buffer sets, Y={}B UV={}B)",
                 sets.len(),
@@ -874,6 +1097,8 @@ impl NvjpegDecoder {
                 alloc_width,
                 alloc_height,
                 validated: false,
+                backend: BackendSelector::new(gpu_hybrid.is_some()),
+                gpu_hybrid,
             })
         }
     }
@@ -963,19 +1188,40 @@ impl NvjpegDecoder {
             pitch: [y_pitch, uv_pitch, uv_pitch, 0],
         };
 
-        // Decode on GPU (async on CUDA stream)
+        // Decode on GPU (async on CUDA stream), with whichever backend the
+        // selector is trying or has chosen.
+        let started = std::time::Instant::now();
+        let mut backend = self.backend.next();
+        if backend == Backend::GpuHybrid {
+            let hybrid = self.gpu_hybrid.as_ref().expect("selector only picks an available backend");
+            match unsafe { hybrid.decode(&self.nvjpeg, self.handle, &jpeg_data, &mut output, self.stream) } {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!("nvJPEG GPU-Huffman backend does not support this stream; using the default backend");
+                    self.backend.reject_gpu_hybrid();
+                    backend = Backend::Default;
+                }
+                Err(error) => {
+                    warn!("nvJPEG GPU-Huffman backend failed ({error}); using the default backend");
+                    self.backend.reject_gpu_hybrid();
+                    backend = Backend::Default;
+                }
+            }
+        }
         unsafe {
-            let res = (self.nvjpeg.decode)(
-                self.handle,
-                self.state,
-                (*jpeg_data).as_ptr(),
-                (*jpeg_data).len(),
-                NVJPEG_OUTPUT_YUV,
-                &mut output,
-                self.stream,
-            );
-            if res != NVJPEG_STATUS_SUCCESS {
-                return Err(GpuDecodeError::Nvjpeg("nvjpegDecode", res));
+            if backend == Backend::Default {
+                let res = (self.nvjpeg.decode)(
+                    self.handle,
+                    self.state,
+                    (*jpeg_data).as_ptr(),
+                    (*jpeg_data).len(),
+                    NVJPEG_OUTPUT_YUV,
+                    &mut output,
+                    self.stream,
+                );
+                if res != NVJPEG_STATUS_SUCCESS {
+                    return Err(GpuDecodeError::Nvjpeg("nvjpegDecode", res));
+                }
             }
 
             // Synchronize — wait for GPU decode to finish
@@ -983,6 +1229,12 @@ impl NvjpegDecoder {
             if res != CUDA_SUCCESS {
                 return Err(GpuDecodeError::Cuda("cuStreamSynchronize", res));
             }
+        }
+        let millis = started.elapsed().as_secs_f32() * 1000.0;
+        if let Some((choice, default, gpu)) = self.backend.record(backend, millis) {
+            info!(
+                "nvJPEG backend selected: {choice:?} (median decode {default:.2} ms default, {gpu:.2} ms GPU-Huffman)"
+            );
         }
 
         match &mut self.mode {
@@ -1205,6 +1457,9 @@ impl Drop for NvjpegDecoder {
             }
 
             // Destroy nvJPEG resources
+            if let Some(mut hybrid) = self.gpu_hybrid.take() {
+                hybrid.destroy(&self.nvjpeg);
+            }
             (self.nvjpeg.state_destroy)(self.state);
             (self.nvjpeg.destroy)(self.handle);
 
@@ -1216,3 +1471,39 @@ impl Drop for NvjpegDecoder {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_alternates_then_keeps_the_faster_backend() {
+        let mut selector = BackendSelector::new(true);
+        let mut decision = None;
+        let mut frames = 0;
+        while decision.is_none() {
+            let backend = selector.next();
+            // GPU-Huffman is faster in this run, with a slow warm-up frame.
+            let millis = match (backend, frames) {
+                (_, 0 | 1) => 50.0,
+                (Backend::Default, _) => 4.5,
+                (Backend::GpuHybrid, _) => 2.0,
+            };
+            decision = selector.record(backend, millis);
+            frames += 1;
+        }
+        assert_eq!(decision, Some((Backend::GpuHybrid, 4.5, 2.0)));
+        assert_eq!(frames, 2 * (TRIAL_FRAMES + WARMUP_FRAMES as usize));
+        assert_eq!(selector.next(), Backend::GpuHybrid);
+    }
+
+    #[test]
+    fn selector_uses_default_when_gpu_hybrid_is_unavailable_or_rejected() {
+        assert_eq!(BackendSelector::new(false).next(), Backend::Default);
+        let mut selector = BackendSelector::new(true);
+        selector.record(Backend::Default, 3.0);
+        assert_eq!(selector.next(), Backend::GpuHybrid);
+        selector.reject_gpu_hybrid();
+        assert_eq!(selector.next(), Backend::Default);
+        assert_eq!(selector.record(Backend::Default, 3.0), None);
+    }
+}
