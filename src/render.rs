@@ -357,13 +357,15 @@ impl Renderer {
                 self.super_resolution_status = message.to_owned();
                 return false;
             }
+            let color_matrix = self.color_matrix_mode();
             let rebuild = self.vsr.as_ref().map_or(true, |v|
-                v.dimensions != dimensions || v.format != frame.format);
+                v.dimensions != dimensions || v.format != frame.format || v.color_matrix != color_matrix);
             if rebuild {
                 // Tear down the old bridge before allocating its replacement.
                 self.vsr = None;
                 match vsr::VsrRender::new(&self.device, &self.queue, frame,
-                    &self.video_bind_group_layout, &self.video_samplers, &self.image_uniforms, self.config.format, dimensions) {
+                    &self.video_bind_group_layout, &self.video_samplers, &self.image_uniforms, self.config.format, dimensions,
+                    color_matrix) {
                     Ok(v) => { self.vsr = Some(v); }
                     Err(error) => {
                         tracing::warn!("RTX Super Resolution unavailable: {error}");
@@ -406,6 +408,7 @@ impl Renderer {
         if self.image_adjustments != adjustments {
             self.image_adjustments = adjustments;
             self.queue.write_buffer(&self.image_uniforms, 0, bytemuck::cast_slice(&adjustments.uniforms()));
+            self.write_color_matrix();
         }
     }
 
@@ -447,6 +450,18 @@ impl Renderer {
             } => self.upload_gpu_frame(*width, *height, *buffer_index, lease.clone()),
         }
         self.reduce_artifacts(frame.quant());
+        self.write_color_matrix();
+    }
+
+    /// The matrix mode for the current frame, from the setting and its height.
+    fn color_matrix_mode(&self) -> u32 {
+        let height = self.video_frame.as_ref().map_or(1080, |frame| frame.height);
+        self.image_adjustments.color_matrix.shader_mode(height)
+    }
+
+    fn write_color_matrix(&self) {
+        // Offset 16: past format_mode, filter_mode and viewport_size.
+        self.queue.write_buffer(&self.uniforms, 16, bytemuck::bytes_of(&self.color_matrix_mode()));
     }
 
     /// Runs MJPEG artifact reduction on the frame just uploaded, submitting
@@ -900,10 +915,10 @@ struct VideoUniforms {
     format_mode: u32,
     filter_mode: u32,
     viewport_size: [f32; 2],
-    // WGSL struct has _padding0: vec3<u32> (12 bytes) for 16-byte alignment.
-    // Total struct size = 28 bytes, but uniform buffers round up to 16-byte
-    // alignment so we pad to 32 bytes.
-    _padding: [u32; 4],
+    /// 0 = BT.601, 1 = BT.709 (`ColorMatrix::shader_mode`).
+    color_matrix: u32,
+    // Pads the struct to 32 bytes, matching the WGSL layout.
+    _padding: [u32; 3],
 }
 
 impl VideoUniforms {
@@ -1178,7 +1193,10 @@ struct VideoUniforms {
     format_mode: u32,
     filter_mode: u32,
     viewport_size: vec2<f32>,
-    _padding0: vec3<u32>,
+    color_matrix: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
 };
 
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -1401,15 +1419,30 @@ fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> vec2<f32> {
 // YUV → RGB color conversion
 // ---------------------------------------------------------------------------
 
-fn sample_yuvj422p(uv: vec2<f32>) -> vec3<f32> {
-    let y = sample_plane(y_tex, uv).x;
-    let u = sample_plane(u_tex, uv).x - 0.5;
-    let v = sample_plane(v_tex, uv).x - 0.5;
+// Y in [0, 1], U and V centred on 0. The matrix is the one the source was
+// encoded with; decoding BT.709 video with BT.601 shifts greens and reds.
+fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
+    if uniforms.color_matrix == 1u {
+        // BT.709: Kr = 0.2126, Kb = 0.0722
+        return vec3<f32>(
+            y + 1.5748 * v,
+            y - 0.187324 * u - 0.468124 * v,
+            y + 1.8556 * u,
+        );
+    }
+    // BT.601: Kr = 0.299, Kb = 0.114
     return vec3<f32>(
         y + 1.402 * v,
         y - 0.344136 * u - 0.714136 * v,
         y + 1.772 * u,
     );
+}
+
+fn sample_yuvj422p(uv: vec2<f32>) -> vec3<f32> {
+    let y = sample_plane(y_tex, uv).x;
+    let u = sample_plane(u_tex, uv).x - 0.5;
+    let v = sample_plane(v_tex, uv).x - 0.5;
+    return yuv_to_rgb(y, u, v);
 }
 
 fn sample_nv12(uv: vec2<f32>) -> vec3<f32> {
@@ -1421,11 +1454,7 @@ fn sample_nv12(uv: vec2<f32>) -> vec3<f32> {
     let y_limited = clamp((y - (16.0 / 255.0)) * (255.0 / 219.0), 0.0, 1.0);
     let u_limited = (u - (128.0 / 255.0)) * (255.0 / 224.0);
     let v_limited = (v - (128.0 / 255.0)) * (255.0 / 224.0);
-    return vec3<f32>(
-        y_limited + 1.402 * v_limited,
-        y_limited - 0.344136 * u_limited - 0.714136 * v_limited,
-        y_limited + 1.772 * u_limited,
-    );
+    return yuv_to_rgb(y_limited, u_limited, v_limited);
 }
 
 @fragment

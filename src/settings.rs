@@ -77,12 +77,55 @@ pub struct ImageAdjustments {
     /// On/off switch for artifact reduction, so a hotkey can toggle it
     /// without losing the chosen strength.
     pub artifact_reduction_enabled: bool,
+    /// YCbCr-to-RGB matrix used to decode the capture.
+    pub color_matrix: ColorMatrix,
+}
+
+/// Which colour matrix the capture's YCbCr was encoded with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMatrix {
+    /// BT.709 for HD (720 lines and up), BT.601 below: the convention HDMI
+    /// sources and video players follow when nothing is signalled.
+    #[default]
+    Auto,
+    Bt601,
+    Bt709,
+}
+
+impl ColorMatrix {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Bt709, Self::Bt601];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (BT.709 for HD, BT.601 for SD)",
+            Self::Bt709 => "BT.709 (HD)",
+            Self::Bt601 => "BT.601 (SD)",
+        }
+    }
+
+    /// The matrix to apply to a frame `height` lines tall: never `Auto`.
+    pub fn resolve(self, height: u32) -> Self {
+        match self {
+            Self::Auto if height >= 720 => Self::Bt709,
+            Self::Auto => Self::Bt601,
+            explicit => explicit,
+        }
+    }
+
+    /// The `color_matrix` value the video shader branches on.
+    pub fn shader_mode(self, height: u32) -> u32 {
+        match self.resolve(height) {
+            Self::Bt709 => 1,
+            _ => 0,
+        }
+    }
 }
 impl Default for ImageAdjustments {
     fn default() -> Self {
         Self { vsr_sharpness: 50.0, brightness: 0.0, contrast: 100.0,
                saturation: 100.0, hue: 0.0, gamma: 1.0, artifact_reduction: 100.0,
-               artifact_reduction_enabled: true }
+               artifact_reduction_enabled: true, color_matrix: ColorMatrix::Auto }
     }
 }
 impl ImageAdjustments {
@@ -99,6 +142,7 @@ impl ImageAdjustments {
             gamma: limit(self.gamma, 0.25, 3.0, 1.0),
             artifact_reduction: limit(self.artifact_reduction, 0.0, 200.0, 100.0),
             artifact_reduction_enabled: self.artifact_reduction_enabled,
+            color_matrix: self.color_matrix,
         }
     }
     /// Eight scalars, matching the 32-byte ImageParams WGSL uniform.
@@ -340,7 +384,7 @@ mod tests {
         assert_eq!(partial.image_adjustments.artifact_reduction, 100.0);
         let p = ImageAdjustments { vsr_sharpness: 20.0, brightness: -12.0, contrast: 115.0,
             saturation: 90.0, hue: 25.0, gamma: 1.2, artifact_reduction: 60.0,
-            artifact_reduction_enabled: false };
+            artifact_reduction_enabled: false, color_matrix: ColorMatrix::Bt601 };
         let settings = Settings { image_adjustments: p, ..Settings::default() };
         let decoded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.image_adjustments, p);
@@ -350,12 +394,26 @@ mod tests {
     fn invalid_image_controls_cannot_send_nonfinite_values_to_gpu() {
         let bad = ImageAdjustments { vsr_sharpness: -400.0, brightness: f32::NAN,
             contrast: f32::INFINITY, saturation: -5.0, hue: 500.0, gamma: 0.0,
-            artifact_reduction: f32::NAN, artifact_reduction_enabled: true };
+            artifact_reduction: f32::NAN, artifact_reduction_enabled: true,
+            color_matrix: ColorMatrix::Bt709 };
         let p = bad.sanitized();
         assert_eq!(p, ImageAdjustments { vsr_sharpness: 0.0, brightness: 0.0,
             contrast: 100.0, saturation: 0.0, hue: 180.0, gamma: 0.25, artifact_reduction: 100.0,
-            artifact_reduction_enabled: true });
+            artifact_reduction_enabled: true, color_matrix: ColorMatrix::Bt709 });
         assert!(bad.uniforms().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn color_matrix_auto_follows_resolution() {
+        assert_eq!(ColorMatrix::Auto.resolve(1080), ColorMatrix::Bt709);
+        assert_eq!(ColorMatrix::Auto.resolve(720), ColorMatrix::Bt709);
+        assert_eq!(ColorMatrix::Auto.resolve(480), ColorMatrix::Bt601);
+        assert_eq!(ColorMatrix::Bt601.resolve(2160), ColorMatrix::Bt601);
+        assert_eq!(ColorMatrix::Bt709.shader_mode(480), 1);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.image_adjustments.color_matrix, ColorMatrix::Auto);
+        let saved: Settings = serde_json::from_str(r#"{"image_adjustments":{"color_matrix":"bt601"}}"#).unwrap();
+        assert_eq!(saved.image_adjustments.color_matrix, ColorMatrix::Bt601);
     }
 
     #[test]

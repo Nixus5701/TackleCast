@@ -4,6 +4,8 @@ New: **MJPEG artifact reduction** (Esc > Video), a quantization-aware GPU filter
 
 New: **live latency** in the FPS overlay, with a per-stage breakdown in the detailed overlay. See [docs/LATENCY-OVERLAY.md](docs/LATENCY-OVERLAY.md).
 
+New: **hotkeys** (F6 Super Resolution, F7 artifact reduction, rebindable) and a **colour matrix** setting (BT.709 for HD by default). See [docs/HOTKEYS-AND-COLOUR.md](docs/HOTKEYS-AND-COLOUR.md).
+
 This edition includes the capture fallback fix, latest-frame selection after display acquisition, and a Mailbox/Immediate presentation menu. See [docs/LATENCY-UPDATE.md](docs/LATENCY-UPDATE.md).
 
 # TackleCast

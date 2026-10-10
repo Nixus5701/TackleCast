@@ -7,6 +7,7 @@ pub(super) struct VsrRender {
     bridge: Bridge,
     pub dimensions: Dimensions,
     pub format: PixelFormat,
+    pub color_matrix: u32,
     source: wgpu::Texture,
     enhanced: wgpu::Texture,
     source_bind_group: wgpu::BindGroup,
@@ -21,7 +22,8 @@ impl VsrRender {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: &VideoFrameResources,
                source_layout: &wgpu::BindGroupLayout, samplers: &VideoSamplers,
                image_uniforms: &wgpu::Buffer,
-               target_format: wgpu::TextureFormat, dimensions: Dimensions) -> Result<Self, String> {
+               target_format: wgpu::TextureFormat, dimensions: Dimensions,
+               color_matrix: u32) -> Result<Self, String> {
         let dimensions = dimensions.validate().map_err(str::to_owned)?;
         let bridge = Bridge::new(device, queue, dimensions)?;
         let source = texture(device, dimensions.input_width, dimensions.input_height,
@@ -34,7 +36,8 @@ impl VsrRender {
                 format_mode: VideoUniforms::format_mode_for(frame.format),
                 filter_mode: 0,
                 viewport_size: [dimensions.input_width as f32, dimensions.input_height as f32],
-                _padding: [0; 4],
+                color_matrix,
+                _padding: [0; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -73,7 +76,7 @@ impl VsrRender {
             ],
         });
         let pipeline = pipeline(device, &output_layout, DISPLAY_SHADER, target_format);
-        Ok(Self { bridge, dimensions, format: frame.format, source, enhanced,
+        Ok(Self { bridge, dimensions, format: frame.format, color_matrix, source, enhanced,
                   source_bind_group, clean_source_bind_group, source_pipeline, bind_group, pipeline, last_serial: None })
     }
 

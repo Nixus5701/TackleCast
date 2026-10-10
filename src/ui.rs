@@ -1,6 +1,6 @@
 use crate::devices::AudioDevice;
 use crate::hotkeys::{self, HotkeyAction};
-use crate::settings::{Settings, ImageAdjustments, ScaleFilter, PresentationMode, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
+use crate::settings::{Settings, ColorMatrix, ImageAdjustments, ScaleFilter, PresentationMode, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
 use egui::{
     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
     Margin, RichText, Slider, Stroke,
@@ -399,6 +399,18 @@ fn draw_menu(
                             Slider::new(&mut draft.image_adjustments.vsr_sharpness, 0.0..=100.0)
                                 .text("VSR sharpness").suffix("%").step_by(1.0))
                             .on_hover_text("Post-VSR filter: 0% softer, 50% unchanged (default), 100% sharper. Applies only when the enhanced video is displayed.");
+                        ui.label(RichText::new("Colour matrix").color(COLOR_TEXT_SECONDARY));
+                        ComboBox::from_id_salt("color_matrix")
+                            .width(ui.available_width())
+                            .selected_text(draft.image_adjustments.color_matrix.label())
+                            .show_ui(ui, |ui| {
+                                for matrix in ColorMatrix::ALL {
+                                    ui.selectable_value(&mut draft.image_adjustments.color_matrix, matrix, matrix.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text("How the capture's colours are decoded. HD consoles send BT.709; if greens or reds look off, compare the options. Live preview.");
+
                         ui.collapsing("Image adjustments", |ui| {
                             let p = &mut draft.image_adjustments;
                             ui.add(Slider::new(&mut p.brightness, -100.0..=100.0).text("Brightness").step_by(1.0));
