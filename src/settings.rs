@@ -43,6 +43,22 @@ pub struct Settings {
     /// over three lines. Off by default, keeping the overlay to one line.
     #[serde(default)]
     pub detailed_overlay: bool,
+    #[serde(default)]
+    pub hotkeys: Hotkeys,
+}
+
+/// Key bindings, stored as winit `KeyCode` names; an empty string is unbound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hotkeys {
+    pub super_resolution: String,
+    pub artifact_reduction: String,
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Self { super_resolution: "F6".to_owned(), artifact_reduction: "F7".to_owned() }
+    }
 }
 
 /// Display controls; sharpness is a post-VSR filter, not a driver parameter.
@@ -58,11 +74,15 @@ pub struct ImageAdjustments {
     /// MJPEG artifact reduction strength in percent; 0 is off, 100 the tuned
     /// default. Only MJPEG frames are filtered.
     pub artifact_reduction: f32,
+    /// On/off switch for artifact reduction, so a hotkey can toggle it
+    /// without losing the chosen strength.
+    pub artifact_reduction_enabled: bool,
 }
 impl Default for ImageAdjustments {
     fn default() -> Self {
         Self { vsr_sharpness: 50.0, brightness: 0.0, contrast: 100.0,
-               saturation: 100.0, hue: 0.0, gamma: 1.0, artifact_reduction: 100.0 }
+               saturation: 100.0, hue: 0.0, gamma: 1.0, artifact_reduction: 100.0,
+               artifact_reduction_enabled: true }
     }
 }
 impl ImageAdjustments {
@@ -78,6 +98,7 @@ impl ImageAdjustments {
             hue: limit(self.hue, -180.0, 180.0, 0.0),
             gamma: limit(self.gamma, 0.25, 3.0, 1.0),
             artifact_reduction: limit(self.artifact_reduction, 0.0, 200.0, 100.0),
+            artifact_reduction_enabled: self.artifact_reduction_enabled,
         }
     }
     /// Eight scalars, matching the 32-byte ImageParams WGSL uniform.
@@ -174,6 +195,7 @@ impl Default for Settings {
             volume: default_volume(),
             show_overlay: default_show_overlay(),
             detailed_overlay: false,
+            hotkeys: Hotkeys::default(),
         }
     }
 }
@@ -317,7 +339,8 @@ mod tests {
         assert_eq!(partial.image_adjustments.contrast, 100.0);
         assert_eq!(partial.image_adjustments.artifact_reduction, 100.0);
         let p = ImageAdjustments { vsr_sharpness: 20.0, brightness: -12.0, contrast: 115.0,
-            saturation: 90.0, hue: 25.0, gamma: 1.2, artifact_reduction: 60.0 };
+            saturation: 90.0, hue: 25.0, gamma: 1.2, artifact_reduction: 60.0,
+            artifact_reduction_enabled: false };
         let settings = Settings { image_adjustments: p, ..Settings::default() };
         let decoded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(decoded.image_adjustments, p);
@@ -327,11 +350,24 @@ mod tests {
     fn invalid_image_controls_cannot_send_nonfinite_values_to_gpu() {
         let bad = ImageAdjustments { vsr_sharpness: -400.0, brightness: f32::NAN,
             contrast: f32::INFINITY, saturation: -5.0, hue: 500.0, gamma: 0.0,
-            artifact_reduction: f32::NAN };
+            artifact_reduction: f32::NAN, artifact_reduction_enabled: true };
         let p = bad.sanitized();
         assert_eq!(p, ImageAdjustments { vsr_sharpness: 0.0, brightness: 0.0,
-            contrast: 100.0, saturation: 0.0, hue: 180.0, gamma: 0.25, artifact_reduction: 100.0 });
+            contrast: 100.0, saturation: 0.0, hue: 180.0, gamma: 0.25, artifact_reduction: 100.0,
+            artifact_reduction_enabled: true });
         assert!(bad.uniforms().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn hotkeys_default_and_persist() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.hotkeys.super_resolution, "F6");
+        assert_eq!(old.hotkeys.artifact_reduction, "F7");
+        assert!(old.image_adjustments.artifact_reduction_enabled);
+        let mut settings = Settings::default();
+        settings.hotkeys.super_resolution = "KeyV".to_owned();
+        let decoded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(decoded.hotkeys, settings.hotkeys);
     }
 
     #[test]

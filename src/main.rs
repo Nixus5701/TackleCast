@@ -9,6 +9,7 @@ mod dx12_interop;
 mod gpu_decode;
 #[cfg(feature = "gpu-decode")]
 mod gpu_monitor;
+mod hotkeys;
 mod jpeg_quant;
 mod latency;
 mod logger;
@@ -57,6 +58,9 @@ const HOUSEKEEPING_TICK: Duration = Duration::from_millis(100);
 /// A capture counts as live while frames have arrived this recently. Used to
 /// decide whether to hold the display awake.
 const CAPTURE_LIVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a hotkey's confirmation stays on screen.
+const TOAST_DURATION: Duration = Duration::from_millis(1500);
 
 /// Events sent from background threads to the winit event loop.
 #[derive(Debug, Clone)]
@@ -179,6 +183,7 @@ struct App {
     last_render_summary: Instant,
     last_cursor_moved: Instant,
     last_frame_at: Option<Instant>,
+    toast: Option<(String, Instant)>,
     #[cfg(feature = "gpu-decode")]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
@@ -217,6 +222,7 @@ impl App {
             last_render_summary: Instant::now(),
             last_cursor_moved: Instant::now(),
             last_frame_at: None,
+            toast: None,
             #[cfg(feature = "gpu-decode")]
             gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
@@ -334,7 +340,30 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         if let WindowEvent::KeyboardInput { event, .. } = &event {
+            // A hotkey being rebound in the menu takes the next key press.
+            if event.state == ElementState::Pressed
+                && self.ui.as_ref().is_some_and(UiState::is_capturing_hotkey)
+            {
+                let key_name = match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => None,
+                    _ => hotkeys::key_name(event.physical_key),
+                };
+                if key_name.is_some() || event.logical_key == Key::Named(NamedKey::Escape) {
+                    if let Some(ui) = &mut self.ui {
+                        ui.finish_hotkey_capture(key_name);
+                    }
+                    window.request_redraw();
+                    return;
+                }
+            }
             if event.state == ElementState::Pressed && !event.repeat {
+                let menu_open = self.ui.as_ref().is_some_and(UiState::is_menu_open);
+                if !menu_open {
+                    if let Some(action) = hotkeys::action_for(&self.settings.hotkeys, event.physical_key) {
+                        self.run_hotkey(action);
+                        return;
+                    }
+                }
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) => {
                         if let Some(ui) = &mut self.ui {
@@ -577,6 +606,12 @@ impl ApplicationHandler<AppEvent> for App {
         // Let the display sleep again once frames have stopped arriving.
         self.update_sleep_suppression();
 
+        // Clear an expired hotkey confirmation even if no frames are arriving.
+        if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST_DURATION) {
+            self.toast = None;
+            status_changed = true;
+        }
+
         // Without incoming frames nothing else redraws, so a capture error
         // would otherwise never reach the overlay.
         if status_changed && !self.is_minimized {
@@ -644,6 +679,27 @@ impl App {
         }
     }
 
+    fn run_hotkey(&mut self, action: hotkeys::HotkeyAction) {
+        let mut settings = self.settings.clone();
+        let message = match action {
+            hotkeys::HotkeyAction::SuperResolution => {
+                settings.request_super_resolution = !settings.request_super_resolution;
+                format!("Super Resolution: {}", on_off(settings.request_super_resolution))
+            }
+            hotkeys::HotkeyAction::ArtifactReduction => {
+                let adjustments = &mut settings.image_adjustments;
+                adjustments.artifact_reduction_enabled = !adjustments.artifact_reduction_enabled;
+                format!("MJPEG artifact reduction: {}", on_off(adjustments.artifact_reduction_enabled))
+            }
+        };
+        info!("hotkey: {message}");
+        self.apply_settings(settings);
+        self.toast = Some((message, Instant::now()));
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn overlay_info(&self) -> OverlayInfo {
         let status_message = if let Some(error_message) = self.latest_error.as_ref() {
             Some(error_message.clone())
@@ -663,6 +719,11 @@ impl App {
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
             latency: self.renderer.as_ref().and_then(Renderer::latency_report),
+            toast: self
+                .toast
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < TOAST_DURATION)
+                .map(|(message, _)| message.clone()),
         }
     }
 
@@ -784,3 +845,6 @@ impl App {
     }
 }
 
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "On" } else { "Off" }
+}

@@ -452,7 +452,11 @@ impl Renderer {
     /// Runs MJPEG artifact reduction on the frame just uploaded, submitting
     /// it ahead of the frame's render (and RTX Super Resolution's input pass).
     fn reduce_artifacts(&mut self, quant: Option<&crate::jpeg_quant::JpegQuant>) {
-        let strength = self.image_adjustments.artifact_reduction.round() as u32;
+        let strength = if self.image_adjustments.artifact_reduction_enabled {
+            self.image_adjustments.artifact_reduction.round() as u32
+        } else {
+            0
+        };
         self.cleanup_active = false;
         let Some(video_frame) = self.video_frame.as_mut() else {
             return;

@@ -1,4 +1,5 @@
 use crate::devices::AudioDevice;
+use crate::hotkeys::{self, HotkeyAction};
 use crate::settings::{Settings, ImageAdjustments, ScaleFilter, PresentationMode, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
 use egui::{
     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
@@ -27,6 +28,8 @@ pub struct UiState {
     egui_winit: State,
     menu_open: bool,
     draft_settings: Settings,
+    /// The hotkey waiting for its new key, while the menu is open.
+    capturing_hotkey: Option<HotkeyAction>,
 }
 
 pub struct OverlayInfo {
@@ -41,6 +44,8 @@ pub struct OverlayInfo {
     pub status_is_alert: bool,
     /// This PC's share of the latency (capture read to display refresh).
     pub latency: Option<crate::latency::LatencySample>,
+    /// Brief confirmation of a hotkey action, shown even with the overlay off.
+    pub toast: Option<String>,
 }
 
 pub struct UiFrame<'a> {
@@ -88,6 +93,18 @@ impl UiState {
             egui_winit,
             menu_open: false,
             draft_settings: Settings::default(),
+            capturing_hotkey: None,
+        }
+    }
+
+    pub fn is_capturing_hotkey(&self) -> bool {
+        self.menu_open && self.capturing_hotkey.is_some()
+    }
+
+    /// Finishes a pending rebind: `Some(name)` binds the key, `None` cancels.
+    pub fn finish_hotkey_capture(&mut self, key_name: Option<&str>) {
+        if let (Some(action), Some(name)) = (self.capturing_hotkey.take(), key_name) {
+            hotkeys::rebind(&mut self.draft_settings.hotkeys, action, name);
         }
     }
 
@@ -101,6 +118,7 @@ impl UiState {
 
     pub fn open_menu(&mut self, settings: &Settings) {
         self.menu_open = true;
+        self.capturing_hotkey = None;
         self.draft_settings = settings.clone();
     }
 
@@ -140,6 +158,7 @@ impl UiState {
                     frame.is_fullscreen,
                     frame.super_resolution_status,
                     frame.artifact_reduction_status,
+                    &mut self.capturing_hotkey,
                     &mut ui_output,
                 );
             }
@@ -200,7 +219,32 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+fn draw_toast(ctx: &egui::Context, message: &str) {
+    egui::Area::new("hotkey_toast".into())
+        .anchor(Align2::CENTER_TOP, [0.0, 16.0])
+        .interactable(false)
+        .movable(false)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(COLOR_PILL_BG)
+                .corner_radius(CornerRadius::same(24))
+                .inner_margin(Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(message).font(FontId::proportional(16.0)).strong().color(COLOR_TEXT_PRIMARY),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+        });
+}
+
 fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
+    if let Some(message) = &overlay.toast {
+        draw_toast(ctx, message);
+    }
     let text = overlay_text(overlay);
     let color = if overlay.status_is_alert {
         COLOR_ACCENT
@@ -248,6 +292,7 @@ fn draw_menu(
     is_fullscreen: bool,
     super_resolution_status: &str,
     artifact_reduction_status: &str,
+    capturing_hotkey: &mut Option<HotkeyAction>,
     output: &mut UiOutput,
 ) {
     let screen_rect = ctx.screen_rect();
@@ -332,14 +377,19 @@ fn draw_menu(
                             &mut draft.scaling_filter
                         );
 
-                        ui.add(Slider::new(&mut draft.image_adjustments.artifact_reduction, 0.0..=200.0)
-                                .text("MJPEG artifact reduction").suffix("%").step_by(5.0))
+                        ui.checkbox(&mut draft.image_adjustments.artifact_reduction_enabled,
+                            format!("MJPEG artifact reduction ({})",
+                                hotkeys::display_name(&draft.hotkeys.artifact_reduction)));
+                        ui.add_enabled(draft.image_adjustments.artifact_reduction_enabled,
+                            Slider::new(&mut draft.image_adjustments.artifact_reduction, 0.0..=200.0)
+                                .text("Strength").suffix("%").step_by(5.0))
                             .on_hover_text("Removes JPEG blocking, ringing and mosquito noise using the stream's own quantization tables; it never removes more than the encoder could have added. 0% is off, 100% the tuned default. Applied before Super Resolution. Live preview.");
                         ui.label(RichText::new(artifact_reduction_status).small().color(COLOR_TEXT_SECONDARY));
 
                         ui.add_enabled(
                             cfg!(all(windows, feature = "rtx-vsr")),
-                            Checkbox::new(&mut draft.request_super_resolution, "Request Super Resolution (NVIDIA RTX)"),
+                            Checkbox::new(&mut draft.request_super_resolution, format!("Request Super Resolution (NVIDIA RTX) ({})",
+                                hotkeys::display_name(&draft.hotkeys.super_resolution))),
                         ).on_hover_text("Reduces compression artifacts and enhances video. Adds GPU work. Enable RTX Video Super Resolution in NVIDIA settings.");
                         if draft.request_super_resolution {
                             ui.label(RichText::new(super_resolution_status).small().color(COLOR_TEXT_SECONDARY));
@@ -382,6 +432,29 @@ fn draw_menu(
                         labeled_audio_combo(ui, "Audio Input", &mut draft.audio_input, audio_inputs);
                         labeled_audio_combo(ui, "Audio Output", &mut draft.audio_output, audio_outputs);
                         labeled_volume(ui, draft);
+
+                        separator(ui);
+                        section_header(ui, "HOTKEYS", text_scale);
+                        for action in HotkeyAction::ALL {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(action.label()).color(COLOR_TEXT_SECONDARY));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let text = if *capturing_hotkey == Some(action) {
+                                        "Press a key… (Esc cancels)".to_owned()
+                                    } else {
+                                        hotkeys::display_name(action.binding(&draft.hotkeys))
+                                    };
+                                    if styled_button(ui, &text).clicked() {
+                                        *capturing_hotkey = Some(action);
+                                    }
+                                });
+                            });
+                        }
+                        if styled_button(ui, "Reset hotkeys").clicked() {
+                            draft.hotkeys = Default::default();
+                            *capturing_hotkey = None;
+                        }
+                        ui.label(RichText::new("Hotkeys work while this menu is closed. Esc and F11 are reserved.").small().color(COLOR_TEXT_SECONDARY));
 
                         separator(ui);
                         section_header(ui, "DISPLAY", text_scale);
